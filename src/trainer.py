@@ -255,7 +255,7 @@ class CGANTrainer:
         fisher_g_forgot, fisher_d_forgot = _compute_fisher_for_loader(forgotten_loader)
         fisher_g_retain, fisher_d_retain = _compute_fisher_for_loader(retained_loader)
 
-        def _prune_by_ratio(module: nn.Module, fisher_forgot: Dict[str, torch.Tensor], fisher_retain: Dict[str, torch.Tensor], threshold: float = 2.0) -> int:
+        def _prune_by_ratio(module: nn.Module, fisher_forgot: Dict[str, torch.Tensor], fisher_retain: Dict[str, torch.Tensor], threshold: float = 10.0) -> int:
             eps = 1e-8
             num_pruned = 0
             for name, param in module.named_parameters():
