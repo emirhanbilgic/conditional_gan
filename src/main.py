@@ -7,17 +7,17 @@ from typing import List
 
 import torch
 
-from .data import CarsSubsetConfig, load_cars_datasets, build_dataloader, filter_dataset_by_new_label
+from .data import ImageNetSubsetConfig, load_imagenet_datasets, build_dataloader, filter_dataset_by_new_label
 from .trainer import TrainConfig, CGANTrainer
 from .fid import FIDConfig, FIDEvaluator
 from .utils import ensure_dir, write_json
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Conditional GAN on Stanford Cars with Unlearning")
-    p.add_argument("--data_dir", type=str, required=True)
+    p = argparse.ArgumentParser(description="Conditional GAN on ImageNet-10 with Unlearning")
+    p.add_argument("--data_dir", type=str, required=True, help="ImageNet-style root with train/ and val/ subfolders")
     p.add_argument("--work_dir", type=str, required=True)
-    p.add_argument("--classes", type=int, nargs="+", required=True, help="Original class indices to include; first is c1 to unlearn")
+    p.add_argument("--classes", type=str, nargs="*", default=None, help="Class names to include; first is c1 to unlearn. If omitted, auto-select 10 alphabetically.")
     p.add_argument("--img_size", type=int, default=64)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--z_dim", type=int, default=128)
@@ -33,15 +33,15 @@ def main() -> None:
     args = parse_args()
     ensure_dir(args.work_dir)
 
-    # 1) Load datasets with selected classes
-    cars_cfg = CarsSubsetConfig(
+    # 1) Load datasets with selected classes (ImageNet-style)
+    im_cfg = ImageNetSubsetConfig(
         data_dir=args.data_dir,
-        selected_classes=args.classes,
+        selected_class_names=args.classes if args.classes is not None and len(args.classes) > 0 else None,
         img_size=args.img_size,
-        download=True,
+        auto_select_k=10,
     )
-    train_ds, test_ds, orig_to_new = load_cars_datasets(cars_cfg)
-    num_classes = len(args.classes)
+    train_ds, val_ds, orig_to_new, class_names = load_imagenet_datasets(im_cfg)
+    num_classes = len(class_names)
 
     # 2) Train CGAN
     tcfg = TrainConfig(
@@ -64,12 +64,11 @@ def main() -> None:
         device=args.device,
     )
     fid_eval = FIDEvaluator(trainer.G, num_classes=num_classes, cfg=fcfg)
-    fid_before = fid_eval.compute_fid(test_ds, z_dim=args.z_dim)
+    fid_before = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)
     write_json(fid_before, os.path.join(args.work_dir, "metrics", "fid_before.json"))
 
     # 4) Unlearn the first selected class (c1)
-    c1_orig = args.classes[0]
-    c1_new = orig_to_new[c1_orig]
+    c1_new = 0  # by construction, the first selected class is mapped to 0
     # filter out all samples equal to c1_new
     indices = [i for i in range(len(train_ds)) if int(train_ds[i][1]) != int(c1_new)]
     from torch.utils.data import Subset
@@ -77,10 +76,12 @@ def main() -> None:
     trainer.finetune_excluding_class(train_without_c1, epochs=args.unlearn_epochs)
 
     # 5) FID after unlearning
-    fid_after = fid_eval.compute_fid(test_ds, z_dim=args.z_dim)
+    fid_after = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)
     write_json(fid_after, os.path.join(args.work_dir, "metrics", "fid_after.json"))
 
     # 6) Print summary
+    print("Selected classes (in order):")
+    print(class_names)
     print("FID before unlearning:")
     print(json.dumps(fid_before, indent=2))
     print("FID after unlearning:")

@@ -1,6 +1,6 @@
-## Conditional GAN on Stanford Cars with Unlearning and FID
+## Conditional GAN on ImageNet-10 with Unlearning and FID
 
-This project trains a conditional GAN on a subset of Stanford Cars classes, computes per-class and overall FID scores, then "unlearns" the first class by fine-tuning on the remaining classes and recomputes FID.
+This project trains a conditional GAN on a subset of 10 ImageNet-style classes, computes per-class and overall FID scores, then "unlearns" the first class by fine-tuning on the remaining classes and recomputes FID.
 
 ### Setup
 
@@ -14,21 +14,23 @@ pip install -r requirements.txt
 
 ```bash
 python -m src.main \
-  --data_dir /path/to/data \
-  --work_dir ./runs/cars_cgan \
+  --data_dir /path/to/imagenet_like_root \
+  --work_dir ./runs/imagenet10_cgan \
   --img_size 64 \
   --batch_size 128 \
   --z_dim 128 \
   --epochs 50 \
   --unlearn_epochs 10 \
   --fid_num_samples_per_class 1000 \
-  --classes 0 1 2 3 4 5 6 7 8 9
+  --classes class_a class_b class_c class_d class_e class_f class_g class_h class_i class_j
 ```
 
 Notes:
-- The `--classes` are Stanford Cars class indices (0..195). The first index is treated as `c1` and will be unlearned.
+- Expects ImageNet-style folders: `data_dir/train/<class_name>/*.jpg` and `data_dir/val/<class_name>/*.jpg`.
+- If you omit `--classes`, the script auto-selects 10 classes alphabetically.
+- The first provided/selected class is treated as `c1` and will be unlearned.
 - Images are resized to 64×64 for DCGAN-style training.
-- FID is computed per-class (using the test split) and overall.
+- FID is computed per-class (using the val split) and overall.
 
 ### Outputs
 
@@ -56,17 +58,17 @@ pip install -q tqdm scipy pandas torchmetrics
 
 ```bash
 python -m src.main \
-  --data_dir /kaggle/working/data \
-  --work_dir /kaggle/working/runs/cars_cgan \
+  --data_dir /kaggle/input/your_imagenet_like_dataset \
+  --work_dir /kaggle/working/runs/imagenet10_cgan \
   --img_size 64 \
   --batch_size 128 \
   --z_dim 128 \
   --epochs 50 \
   --unlearn_epochs 10 \
   --fid_num_samples_per_class 1000 \
-  --classes 0 1 2 3 4 5 6 7 8 9
+  --classes  tench  goldfish  great_white_shark  tiger_shark  hammerhead  electric_ray  stingray  cock  hen  ostrich
 ```
 
-If you prefer Internet Off, upload a Kaggle Dataset containing the original Stanford Cars archives (train/test/devkit) under `/kaggle/input/<dataset>/stanford_cars/` and run with `--data_dir /kaggle/input/<dataset>` and `download=False` (edit `src/main.py` to set `download=False`). FID also needs Inception weights; pre-bundle them or enable Internet for that step.
+If you prefer Internet Off, attach a Kaggle Dataset containing ImageNet-like folders at `/kaggle/input/your_imagenet_like_dataset/{train,val}/<class_name>/*.jpg`. FID also needs Inception weights; pre-bundle them or enable Internet for that step.
 
 
