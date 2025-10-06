@@ -26,7 +26,9 @@ python -m src.main \
 ```
 
 Notes:
-- Expects ImageNet-style folders: `data_dir/train/<class_name>/*.jpg` and `data_dir/val/<class_name>/*.jpg`.
+- You can provide either:
+  - ImageNet-style: `data_dir/train/<class_name>/*.jpg` and `data_dir/val/<class_name>/*.jpg`, or
+  - Single-folder: `data_dir/<class_name>/*.jpg` (the script will split into train/val using `--val_split`).
 - If you omit `--classes`, the script auto-selects 10 classes alphabetically.
 - The first provided/selected class is treated as `c1` and will be unlearned.
 - Images are resized to 64×64 for DCGAN-style training.

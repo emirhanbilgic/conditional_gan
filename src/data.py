@@ -24,6 +24,8 @@ class ImageNetSubsetConfig:
     selected_class_names: List[str] | None
     img_size: int = 64
     auto_select_k: int = 10  # used if selected_class_names is None
+    val_split: float = 0.2  # used if train/val folders not present
+    seed: int = 42
 
 
 class RemappedSubset(Dataset):
@@ -67,36 +69,67 @@ def load_imagenet_datasets(cfg: ImageNetSubsetConfig) -> Tuple[Dataset, Dataset,
     """
     train_root = os.path.join(cfg.data_dir, "train")
     val_root = os.path.join(cfg.data_dir, "val")
-    if not os.path.isdir(train_root) or not os.path.isdir(val_root):
-        raise FileNotFoundError(f"Expect ImageNet-like folders at {cfg.data_dir}/train and {cfg.data_dir}/val")
-
     tfm = build_transforms(cfg.img_size)
-    train_base = datasets.ImageFolder(root=train_root, transform=tfm)
-    val_base = datasets.ImageFolder(root=val_root, transform=tfm)
 
-    available_classes = list(train_base.class_to_idx.keys())
-    # ensure val has same classes
-    if set(available_classes) != set(val_base.class_to_idx.keys()):
-        raise ValueError("Train and val class sets differ; please align your dataset.")
+    if os.path.isdir(train_root) and os.path.isdir(val_root):
+        # Standard ImageNet-style structure
+        train_base = datasets.ImageFolder(root=train_root, transform=tfm)
+        val_base = datasets.ImageFolder(root=val_root, transform=tfm)
 
-    if cfg.selected_class_names is None or len(cfg.selected_class_names) == 0:
-        selected_class_names = sorted(available_classes)[: cfg.auto_select_k]
+        available_classes = list(train_base.class_to_idx.keys())
+        if set(available_classes) != set(val_base.class_to_idx.keys()):
+            raise ValueError("Train and val class sets differ; please align your dataset.")
+
+        if cfg.selected_class_names is None or len(cfg.selected_class_names) == 0:
+            selected_class_names = sorted(available_classes)[: cfg.auto_select_k]
+        else:
+            for c in cfg.selected_class_names:
+                if c not in available_classes:
+                    raise ValueError(f"Class '{c}' not found in dataset. Available example: {available_classes[:5]} ...")
+            selected_class_names = list(cfg.selected_class_names)
+
+        orig_indices = [train_base.class_to_idx[c] for c in selected_class_names]
+        orig_idx_to_new = {orig: i for i, orig in enumerate(orig_indices)}
+
+        train_idx = _filter_indices_by_orig_indices(train_base, orig_indices)
+        val_idx = _filter_indices_by_orig_indices(val_base, orig_indices)
+
+        train_subset = RemappedSubset(train_base, train_idx, orig_idx_to_new)
+        val_subset = RemappedSubset(val_base, val_idx, orig_idx_to_new)
+        return train_subset, val_subset, orig_idx_to_new, selected_class_names
     else:
-        for c in cfg.selected_class_names:
-            if c not in available_classes:
-                raise ValueError(f"Class '{c}' not found in dataset. Available example: {available_classes[:5]} ...")
-        selected_class_names = list(cfg.selected_class_names)
+        # Single folder with class subdirs; perform stratified split
+        base = datasets.ImageFolder(root=cfg.data_dir, transform=tfm)
+        available_classes = list(base.class_to_idx.keys())
 
-    # Map original ImageFolder indices to new consecutive indices [0..k-1]
-    orig_indices = [train_base.class_to_idx[c] for c in selected_class_names]
-    orig_idx_to_new = {orig: i for i, orig in enumerate(orig_indices)}
+        if cfg.selected_class_names is None or len(cfg.selected_class_names) == 0:
+            selected_class_names = sorted(available_classes)[: cfg.auto_select_k]
+        else:
+            for c in cfg.selected_class_names:
+                if c not in available_classes:
+                    raise ValueError(f"Class '{c}' not found in dataset. Available example: {available_classes[:5]} ...")
+            selected_class_names = list(cfg.selected_class_names)
 
-    train_idx = _filter_indices_by_orig_indices(train_base, orig_indices)
-    val_idx = _filter_indices_by_orig_indices(val_base, orig_indices)
+        orig_indices = [base.class_to_idx[c] for c in selected_class_names]
+        orig_idx_to_new = {orig: i for i, orig in enumerate(orig_indices)}
 
-    train_subset = RemappedSubset(train_base, train_idx, orig_idx_to_new)
-    val_subset = RemappedSubset(val_base, val_idx, orig_idx_to_new)
-    return train_subset, val_subset, orig_idx_to_new, selected_class_names
+        # Build stratified indices
+        g = torch.Generator()
+        g.manual_seed(cfg.seed)
+        train_idx: List[int] = []
+        val_idx: List[int] = []
+        for orig in orig_indices:
+            cls_indices = [i for i in range(len(base.samples)) if int(base.samples[i][1]) == int(orig)]
+            # deterministic shuffle
+            perm = torch.randperm(len(cls_indices), generator=g).tolist()
+            cls_indices = [cls_indices[p] for p in perm]
+            n_val = max(1, int(round(len(cls_indices) * cfg.val_split))) if len(cls_indices) > 0 else 0
+            val_idx.extend(cls_indices[:n_val])
+            train_idx.extend(cls_indices[n_val:])
+
+        train_subset = RemappedSubset(base, train_idx, orig_idx_to_new)
+        val_subset = RemappedSubset(base, val_idx, orig_idx_to_new)
+        return train_subset, val_subset, orig_idx_to_new, selected_class_names
 
 
 def build_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 4, shuffle: bool = True) -> DataLoader:

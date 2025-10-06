@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fid_num_samples_per_class", type=int, default=1000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--val_split", type=float, default=0.2, help="If no train/val folders, split ratio for val")
     return p.parse_args()
 
 
@@ -39,6 +40,8 @@ def main() -> None:
         selected_class_names=args.classes if args.classes is not None and len(args.classes) > 0 else None,
         img_size=args.img_size,
         auto_select_k=10,
+        val_split=args.val_split,
+        seed=args.seed,
     )
     train_ds, val_ds, orig_to_new, class_names = load_imagenet_datasets(im_cfg)
     num_classes = len(class_names)
