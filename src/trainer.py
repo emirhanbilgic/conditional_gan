@@ -153,3 +153,128 @@ class CGANTrainer:
                 step += 1
 
 
+    def unlearn_with_fisher(self, train_ds: Dataset, excluded_label: int, z_dim: int, max_batches: int = 100) -> None:
+        """Unlearn a class by Fisher pruning without further fine-tuning.
+
+        We compute Fisher information diagonals on two subsets: forgotten (Df) and retained (Dr).
+        For each parameter, if Df/Dr > 2, we prune (zero) that weight. Otherwise we leave it untouched.
+        If no weights exceed the threshold, we do nothing else.
+        """
+        device = self.device
+
+        # Build subsets
+        forgotten_indices = [i for i in range(len(train_ds)) if int(train_ds[i][1]) == int(excluded_label)]
+        retained_indices = [i for i in range(len(train_ds)) if int(train_ds[i][1]) != int(excluded_label)]
+
+        if len(forgotten_indices) == 0 or len(retained_indices) == 0:
+            # Nothing to do if a subset is empty
+            return
+
+        forgotten_loader = DataLoader(Subset(train_ds, forgotten_indices), batch_size=self.cfg.batch_size, shuffle=True, num_workers=self.cfg.num_workers, pin_memory=True, drop_last=True)
+        retained_loader = DataLoader(Subset(train_ds, retained_indices), batch_size=self.cfg.batch_size, shuffle=True, num_workers=self.cfg.num_workers, pin_memory=True, drop_last=True)
+
+        def _zeros_like_named_params(module: nn.Module) -> Dict[str, torch.Tensor]:
+            out: Dict[str, torch.Tensor] = {}
+            for name, param in module.named_parameters():
+                if param.requires_grad:
+                    out[name] = torch.zeros_like(param.data, device=param.device)
+            return out
+
+        def _accumulate(module: nn.Module, accum: Dict[str, torch.Tensor]) -> None:
+            for name, param in module.named_parameters():
+                if (not param.requires_grad) or (param.grad is None):
+                    continue
+                accum[name] = accum[name] + (param.grad.detach() ** 2)
+
+        def _normalize(accum: Dict[str, torch.Tensor], denom: float) -> Dict[str, torch.Tensor]:
+            eps = 1e-8
+            return {k: v / max(denom, eps) for k, v in accum.items()}
+
+        def _calculate_fim_diagonal(model: nn.Module, loader: DataLoader, compute_loss_fn) -> Dict[str, torch.Tensor]:
+            """Batchwise squared-gradient Fisher approximation for a single model.
+
+            Sets model to eval mode, averages squared grads over batches.
+            compute_loss_fn(real, y) should return a scalar loss that depends on `model`.
+            """
+            model_was_training = model.training
+            model.eval()
+            fim_diag = _zeros_like_named_params(model)
+            batches_processed = 0
+
+            if len(loader.dataset) == 0:
+                return fim_diag
+
+            for real, y in loader:
+                if batches_processed >= max_batches:
+                    break
+                real = real.to(device)
+                y = y.to(device)
+
+                # zero grads of all involved modules to avoid cross-contamination
+                self.G.zero_grad(set_to_none=True)
+                self.D.zero_grad(set_to_none=True)
+                model.zero_grad(set_to_none=True)
+
+                loss = compute_loss_fn(real, y)
+                loss.backward()
+
+                _accumulate(model, fim_diag)
+                batches_processed += 1
+
+            denom = float(max(1, batches_processed))
+            fim_diag = _normalize(fim_diag, denom)
+
+            if model_was_training:
+                model.train()
+            return fim_diag
+
+        def _compute_fisher_for_loader(loader: DataLoader) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+            # Discriminator Fisher: BCE on real vs fake, with fake generated without backprop to G
+            def d_loss(real: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                bsz = real.size(0)
+                with torch.no_grad():
+                    z = sample_noise(bsz, self.cfg.z_dim, device)
+                    fake = self.G(z, y)
+                pred_real = self.D(real, y)
+                pred_fake = self.D(fake, y)
+                return self.criterion(pred_real, torch.ones_like(pred_real)) + \
+                       self.criterion(pred_fake, torch.zeros_like(pred_fake))
+
+            # Generator Fisher: BCE on D(G(z,y)) vs ones; D participates in forward but only G grads are accumulated
+            def g_loss(real_unused: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                bsz = y.size(0)
+                z = sample_noise(bsz, self.cfg.z_dim, device)
+                fake = self.G(z, y)
+                pred_fake = self.D(fake, y)
+                return self.criterion(pred_fake, torch.ones_like(pred_fake))
+
+            fisher_d = _calculate_fim_diagonal(self.D, loader, d_loss)
+            fisher_g = _calculate_fim_diagonal(self.G, loader, g_loss)
+            return fisher_g, fisher_d
+
+        fisher_g_forgot, fisher_d_forgot = _compute_fisher_for_loader(forgotten_loader)
+        fisher_g_retain, fisher_d_retain = _compute_fisher_for_loader(retained_loader)
+
+        def _prune_by_ratio(module: nn.Module, fisher_forgot: Dict[str, torch.Tensor], fisher_retain: Dict[str, torch.Tensor], threshold: float = 2.0) -> int:
+            eps = 1e-8
+            num_pruned = 0
+            for name, param in module.named_parameters():
+                if not param.requires_grad:
+                    continue
+                ff = fisher_forgot[name]
+                fr = fisher_retain[name]
+                ratio = ff / (fr + eps)
+                mask = ratio > threshold
+                if mask.any():
+                    with torch.no_grad():
+                        num_pruned += int(mask.sum().item())
+                        param.data[mask] = 0.0
+            return num_pruned
+
+        pruned_g = _prune_by_ratio(self.G, fisher_g_forgot, fisher_g_retain)
+        pruned_d = _prune_by_ratio(self.D, fisher_d_forgot, fisher_d_retain)
+
+        # No finetuning afterward per requirement.
+        # Optional: could log counts
+        print(f"Fisher pruning completed: G pruned elements={pruned_g}, D pruned elements={pruned_d}")
+

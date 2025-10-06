@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fid_num_samples_per_class", type=int, default=1000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--unlearning_type", type=str, default="pure_finetuning", choices=["pure_finetuning", "fisher"], help="Unlearning strategy: pure_finetuning or fisher")
     return p.parse_args()
 
 
@@ -95,7 +96,12 @@ def main() -> None:
     indices = [i for i in range(len(train_ds)) if int(train_ds[i][1]) != int(c1_new)]
     from torch.utils.data import Subset
     train_without_c1 = Subset(train_ds, indices)
-    trainer.finetune_excluding_class(train_without_c1, epochs=args.unlearn_epochs)
+    if args.unlearning_type == "pure_finetuning":
+        trainer.finetune_excluding_class(train_without_c1, epochs=args.unlearn_epochs)
+    else:
+        # fisher-based unlearning: compute FIM ratio and prune if needed
+        # When fisher is selected and Df/Dr < 2, we skip finetuning entirely per requirement
+        trainer.unlearn_with_fisher(train_ds=train_ds, excluded_label=c1_new, z_dim=args.z_dim)
 
     # 5) FID after unlearning
     fid_after = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)
