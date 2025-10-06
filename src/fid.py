@@ -23,10 +23,10 @@ class InceptionEmbedder(nn.Module):
         # Be robust to different torchvision versions in Kaggle
         try:
             from torchvision.models import Inception_V3_Weights  # type: ignore
-            model = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False, aux_logits=False)
+            model = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False)
         except Exception:
             # Fallback for older torchvision: uses pretrained flag
-            model = inception_v3(pretrained=True, transform_input=False, aux_logits=False)
+            model = inception_v3(pretrained=True, transform_input=False)
         model.fc = nn.Identity()
         model.eval()
         self.model = model.to(device)
