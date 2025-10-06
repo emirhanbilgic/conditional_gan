@@ -6,19 +6,19 @@ import json
 from typing import List
 
 import torch
+import matplotlib.pyplot as plt
+from torchvision.utils import make_grid
 
-from .data import ImageNetSubsetConfig, load_imagenet_datasets, build_dataloader, filter_dataset_by_new_label
-from .data import download_and_prepare_tiny_imagenet
+from .data import CIFAR10Config, load_cifar10_datasets
 from .trainer import TrainConfig, CGANTrainer
 from .fid import FIDConfig, FIDEvaluator
 from .utils import ensure_dir, write_json
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Conditional GAN on ImageNet-10 with Unlearning")
-    p.add_argument("--data_dir", type=str, default=None, help="Dataset root. If --tiny_imagenet is set, this is the download/extract root.")
+    p = argparse.ArgumentParser(description="Conditional GAN on CIFAR-10 with Unlearning")
+    p.add_argument("--data_dir", type=str, required=True, help="CIFAR-10 root directory for torchvision cache")
     p.add_argument("--work_dir", type=str, required=True)
-    p.add_argument("--classes", type=str, nargs="*", default=None, help="Class names to include; first is c1 to unlearn. If omitted, auto-select 10 alphabetically.")
     p.add_argument("--img_size", type=int, default=64)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--z_dim", type=int, default=128)
@@ -27,9 +27,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fid_num_samples_per_class", type=int, default=1000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--val_split", type=float, default=0.2, help="If no train/val folders, split ratio for val")
-    p.add_argument("--tiny_imagenet", action="store_true", help="Download and use Tiny ImageNet (200 classes)")
-    p.add_argument("--num_classes", type=int, default=10, help="Number of classes to use (auto-selected if --classes omitted)")
     return p.parse_args()
 
 
@@ -37,27 +34,11 @@ def main() -> None:
     args = parse_args()
     ensure_dir(args.work_dir)
 
-    # 1) Prepare dataset root
-    if args.tiny_imagenet:
-        droot = args.data_dir if args.data_dir is not None else "/kaggle/working/data"
-        os.makedirs(droot, exist_ok=True)
-        data_root = download_and_prepare_tiny_imagenet(droot)
-    else:
-        if args.data_dir is None:
-            raise ValueError("--data_dir must be provided when not using --tiny_imagenet")
-        data_root = args.data_dir
-
-    # 2) Load datasets with selected classes (ImageNet-style)
-    im_cfg = ImageNetSubsetConfig(
-        data_dir=data_root,
-        selected_class_names=args.classes if args.classes is not None and len(args.classes) > 0 else None,
-        img_size=args.img_size,
-        auto_select_k=args.num_classes,
-        val_split=args.val_split,
-        seed=args.seed,
-    )
-    train_ds, val_ds, orig_to_new, class_names = load_imagenet_datasets(im_cfg)
-    num_classes = len(class_names)
+    # 1) Load CIFAR-10 datasets
+    os.makedirs(args.data_dir, exist_ok=True)
+    c_cfg = CIFAR10Config(data_dir=args.data_dir, img_size=args.img_size, train_download=True, test_download=True, seed=args.seed)
+    train_ds, val_ds, _, class_names = load_cifar10_datasets(c_cfg)
+    num_classes = 10
 
     # 2) Train CGAN
     tcfg = TrainConfig(
@@ -71,6 +52,31 @@ def main() -> None:
     )
     trainer = CGANTrainer(train_ds, num_classes=num_classes, cfg=tcfg)
     trainer.train()
+
+    # Generate a fresh sample grid after training and display
+    trainer.G.eval()
+    with torch.no_grad():
+        grid_imgs = []
+        per_class = 8
+        for cls in range(num_classes):
+            z = torch.randn(per_class, args.z_dim, device=trainer.device)
+            y = torch.full((per_class,), cls, dtype=torch.long, device=trainer.device)
+            x = trainer.G(z, y).cpu()
+            grid_imgs.append(x)
+        imgs = torch.cat(grid_imgs, dim=0)
+        grid = make_grid(imgs, nrow=per_class, normalize=True, value_range=(-1, 1))
+        # Save final grid
+        os.makedirs(os.path.join(args.work_dir, "samples"), exist_ok=True)
+        from torchvision.utils import save_image as _save_image
+        _save_image(grid, os.path.join(args.work_dir, "samples", "final_grid.png"))
+    trainer.G.train()
+
+    # On-screen display
+    plt.figure(figsize=(12, 12))
+    plt.axis('off')
+    plt.title('CGAN Samples per Class (top->bottom classes)')
+    plt.imshow(grid.permute(1, 2, 0).numpy())
+    plt.show()
 
     # 3) FID before unlearning
     fcfg = FIDConfig(
@@ -96,7 +102,7 @@ def main() -> None:
     write_json(fid_after, os.path.join(args.work_dir, "metrics", "fid_after.json"))
 
     # 6) Print summary
-    print("Selected classes (in order):")
+    print("CIFAR-10 classes (fixed order):")
     print(class_names)
     print("FID before unlearning:")
     print(json.dumps(fid_before, indent=2))

@@ -7,9 +7,6 @@ from typing import List, Dict, Tuple
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import datasets, transforms
-from torchvision.datasets.utils import download_and_extract_archive
-import shutil
-import zipfile
 
 
 def build_transforms(img_size: int) -> transforms.Compose:
@@ -144,61 +141,27 @@ def filter_dataset_by_new_label(dataset: Dataset, label: int) -> Subset:
     return Subset(dataset, indices)
 
 
-def _tiny_imagenet_fix_val_structure(tiny_root: str) -> None:
-    """Reorganize Tiny ImageNet val/ into class subfolders based on val_annotations.txt."""
-    val_dir = os.path.join(tiny_root, "val")
-    images_dir = os.path.join(val_dir, "images")
-    ann_path = os.path.join(val_dir, "val_annotations.txt")
-    if not os.path.exists(ann_path):
-        return
-    # Read annotations: filename, class_id, x, y, w, h
-    with open(ann_path, "r", encoding="utf-8") as f:
-        lines = [l.strip().split("\t") for l in f.readlines() if l.strip()]
-    for parts in lines:
-        if len(parts) < 2:
-            continue
-        fname, cls = parts[0], parts[1]
-        cls_dir = os.path.join(val_dir, cls)
-        os.makedirs(cls_dir, exist_ok=True)
-        src = os.path.join(images_dir, fname)
-        dst = os.path.join(cls_dir, fname)
-        if os.path.exists(src) and not os.path.exists(dst):
-            shutil.move(src, dst)
-    # Remove images directory after moving
-    if os.path.isdir(images_dir) and len(os.listdir(images_dir)) == 0:
-        shutil.rmtree(images_dir, ignore_errors=True)
+@dataclass
+class CIFAR10Config:
+    data_dir: str
+    img_size: int = 64
+    train_download: bool = True
+    test_download: bool = True
+    seed: int = 42
 
 
-def download_and_prepare_tiny_imagenet(dest_root: str) -> str:
+def load_cifar10_datasets(cfg: CIFAR10Config) -> Tuple[Dataset, Dataset, Dict[int, int], List[str]]:
     """
-    Downloads Tiny ImageNet (200 classes, 64x64) and prepares train/val structure.
-    Returns the dataset root path that contains train/ and val/.
+    Loads CIFAR-10 train/test with resizing and normalization to [-1, 1].
+
+    Returns:
+      train_ds, val_ds, orig_idx_to_new (identity), class_names
     """
-    os.makedirs(dest_root, exist_ok=True)
-    tiny_root = os.path.join(dest_root, "tiny-imagenet-200")
-    if os.path.isdir(os.path.join(tiny_root, "train")) and os.path.isdir(os.path.join(tiny_root, "val")):
-        _tiny_imagenet_fix_val_structure(tiny_root)
-        return tiny_root
-
-    urls = [
-        "http://cs231n.stanford.edu/tiny-imagenet-200.zip",
-        # Fallback mirrors (may not always be available):
-        "https://github.com/fastai/imagenette/releases/download/various/tiny-imagenet-200.zip",
-    ]
-
-    last_err: Exception | None = None
-    for url in urls:
-        try:
-            download_and_extract_archive(url, download_root=dest_root, extract_root=dest_root, remove_finished=True)
-            break
-        except Exception as e:
-            last_err = e
-            continue
-
-    if not os.path.isdir(tiny_root):
-        raise RuntimeError(f"Failed to download Tiny ImageNet. Last error: {last_err}")
-
-    _tiny_imagenet_fix_val_structure(tiny_root)
-    return tiny_root
+    tfm = build_transforms(cfg.img_size)
+    train_ds = datasets.CIFAR10(root=cfg.data_dir, train=True, transform=tfm, download=cfg.train_download)
+    val_ds = datasets.CIFAR10(root=cfg.data_dir, train=False, transform=tfm, download=cfg.test_download)
+    class_names: List[str] = list(train_ds.classes)
+    orig_idx_to_new: Dict[int, int] = {i: i for i in range(len(class_names))}
+    return train_ds, val_ds, orig_idx_to_new, class_names
 
 
