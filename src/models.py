@@ -98,9 +98,11 @@ def weights_init(m: nn.Module) -> None:
         nn.init.normal_(m.weight, 0.0, 0.02)
         if getattr(m, 'bias', None) is not None and m.bias is not None:
             nn.init.zeros_(m.bias)
-    elif isinstance(m, (nn.BatchNorm2d,)):
-        nn.init.normal_(m.weight, 1.0, 0.02)
-        nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.BatchNorm2d):
+        # Only initialize if affine parameters exist
+        if m.affine and (m.weight is not None) and (m.bias is not None):
+            nn.init.ones_(m.weight)
+            nn.init.zeros_(m.bias)
 
 
 def build_models(z_dim: int, num_classes: int, img_channels: int = 3, base_channels: int = 64) -> Tuple[Generator, Discriminator]:
