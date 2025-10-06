@@ -54,29 +54,27 @@ def main() -> None:
     trainer = CGANTrainer(train_ds, num_classes=num_classes, cfg=tcfg)
     trainer.train()
 
-    # Generate a fresh sample grid after training and display
+    # Generate a grid before unlearning: one example per class and display
     trainer.G.eval()
     with torch.no_grad():
-        grid_imgs = []
-        per_class = 8
+        imgs_before = []
+        per_class = 1
         for cls in range(num_classes):
             z = torch.randn(per_class, args.z_dim, device=trainer.device)
             y = torch.full((per_class,), cls, dtype=torch.long, device=trainer.device)
             x = trainer.G(z, y).cpu()
-            grid_imgs.append(x)
-        imgs = torch.cat(grid_imgs, dim=0)
-        grid = make_grid(imgs, nrow=per_class, normalize=True, value_range=(-1, 1))
-        # Save final grid
+            imgs_before.append(x)
+        imgs_before = torch.cat(imgs_before, dim=0)
+        grid_before = make_grid(imgs_before, nrow=num_classes, normalize=True, value_range=(-1, 1))
         os.makedirs(os.path.join(args.work_dir, "samples"), exist_ok=True)
         from torchvision.utils import save_image as _save_image
-        _save_image(grid, os.path.join(args.work_dir, "samples", "final_grid.png"))
+        _save_image(grid_before, os.path.join(args.work_dir, "samples", "before_unlearning.png"))
     trainer.G.train()
 
-    # On-screen display
-    plt.figure(figsize=(12, 12))
+    plt.figure(figsize=(12, 3))
     plt.axis('off')
-    plt.title('CGAN Samples per Class (top->bottom classes)')
-    plt.imshow(grid.permute(1, 2, 0).numpy())
+    plt.title('Before Unlearning: 1 sample per class')
+    plt.imshow(grid_before.permute(1, 2, 0).numpy())
     plt.show()
 
     # 3) FID before unlearning
@@ -102,6 +100,29 @@ def main() -> None:
         # fisher-based unlearning: compute FIM ratio and prune if needed
         # When fisher is selected and Df/Dr < 2, we skip finetuning entirely per requirement
         trainer.unlearn_with_fisher(train_ds=train_ds, excluded_label=c1_new, z_dim=args.z_dim)
+
+    # Generate a grid after unlearning: one example per class and display
+    trainer.G.eval()
+    with torch.no_grad():
+        imgs_after = []
+        per_class = 1
+        for cls in range(num_classes):
+            z = torch.randn(per_class, args.z_dim, device=trainer.device)
+            y = torch.full((per_class,), cls, dtype=torch.long, device=trainer.device)
+            x = trainer.G(z, y).cpu()
+            imgs_after.append(x)
+        imgs_after = torch.cat(imgs_after, dim=0)
+        grid_after = make_grid(imgs_after, nrow=num_classes, normalize=True, value_range=(-1, 1))
+        os.makedirs(os.path.join(args.work_dir, "samples"), exist_ok=True)
+        from torchvision.utils import save_image as _save_image
+        _save_image(grid_after, os.path.join(args.work_dir, "samples", "after_unlearning.png"))
+    trainer.G.train()
+
+    plt.figure(figsize=(12, 3))
+    plt.axis('off')
+    plt.title('After Unlearning: 1 sample per class')
+    plt.imshow(grid_after.permute(1, 2, 0).numpy())
+    plt.show()
 
     # 5) FID after unlearning
     fid_after = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)
