@@ -7,7 +7,8 @@ from typing import List
 
 import torch
 import matplotlib.pyplot as plt
-from torchvision.utils import make_grid
+from torchvision.utils import make_grid, save_image
+from datetime import datetime
 
 from .data import CIFAR10Config, load_cifar10_datasets
 from .trainer import TrainConfig, CGANTrainer
@@ -28,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--unlearning_type", type=str, default="pure_finetuning", choices=["pure_finetuning", "fisher"], help="Unlearning strategy: pure_finetuning or fisher")
+    p.add_argument("--samples_per_class", type=int, default=5, help="Number of samples to generate per class for before/after snapshots")
     return p.parse_args()
 
 
@@ -54,26 +56,51 @@ def main() -> None:
     trainer = CGANTrainer(train_ds, num_classes=num_classes, cfg=tcfg)
     trainer.train()
 
-    # Generate a grid before unlearning: one example per class and display
+    # Create a unique directory per trial to avoid overwrite across runs
+    samples_root = os.path.join(args.work_dir, "samples")
+    os.makedirs(samples_root, exist_ok=True)
+    trial_tag = datetime.now().strftime("%Y%m%d-%H%M%S")
+    trial_base = f"trial_{trial_tag}_seed{args.seed}_{args.unlearning_type}"
+    trial_dir = os.path.join(samples_root, trial_base)
+    if os.path.exists(trial_dir):
+        # If a run starts within the same second, add a numeric suffix to avoid overwrite
+        suffix = 1
+        while True:
+            candidate = os.path.join(samples_root, f"{trial_base}_{suffix:03d}")
+            if not os.path.exists(candidate):
+                trial_dir = candidate
+                break
+            suffix += 1
+    os.makedirs(trial_dir, exist_ok=True)
+
+    # Generate samples before unlearning: N samples per class
     trainer.G.eval()
     with torch.no_grad():
         imgs_before = []
-        per_class = 1
+        per_class = int(max(1, args.samples_per_class))
+        before_dir = os.path.join(trial_dir, "before_unlearning")
+        os.makedirs(before_dir, exist_ok=True)
         for cls in range(num_classes):
             z = torch.randn(per_class, args.z_dim, device=trainer.device)
             y = torch.full((per_class,), cls, dtype=torch.long, device=trainer.device)
             x = trainer.G(z, y).cpu()
             imgs_before.append(x)
+
+            # Save individual images per class
+            class_dir = os.path.join(before_dir, f"class_{cls}")
+            os.makedirs(class_dir, exist_ok=True)
+            for i in range(per_class):
+                save_image(x[i], os.path.join(class_dir, f"img_{i+1}.png"), normalize=True, value_range=(-1, 1))
+
         imgs_before = torch.cat(imgs_before, dim=0)
-        grid_before = make_grid(imgs_before, nrow=num_classes, normalize=True, value_range=(-1, 1))
-        os.makedirs(os.path.join(args.work_dir, "samples"), exist_ok=True)
-        from torchvision.utils import save_image as _save_image
-        _save_image(grid_before, os.path.join(args.work_dir, "samples", "before_unlearning.png"))
+        # Combined grid with nrow = samples per class, rows = classes
+        grid_before = make_grid(imgs_before, nrow=per_class, normalize=True, value_range=(-1, 1))
+        save_image(grid_before, os.path.join(before_dir, "grid_all_classes.png"))
     trainer.G.train()
 
     plt.figure(figsize=(12, 3))
     plt.axis('off')
-    plt.title('Before Unlearning: 1 sample per class')
+    plt.title(f'Before Unlearning: {per_class} samples per class')
     plt.imshow(grid_before.permute(1, 2, 0).numpy())
     plt.show()
 
@@ -101,26 +128,33 @@ def main() -> None:
         # When fisher is selected and Df/Dr < 2, we skip finetuning entirely per requirement
         trainer.unlearn_with_fisher(train_ds=train_ds, excluded_label=c1_new, z_dim=args.z_dim)
 
-    # Generate a grid after unlearning: one example per class and display
+    # Generate samples after unlearning: N samples per class
     trainer.G.eval()
     with torch.no_grad():
         imgs_after = []
-        per_class = 1
+        per_class = int(max(1, args.samples_per_class))
+        after_dir = os.path.join(trial_dir, "after_unlearning")
+        os.makedirs(after_dir, exist_ok=True)
         for cls in range(num_classes):
             z = torch.randn(per_class, args.z_dim, device=trainer.device)
             y = torch.full((per_class,), cls, dtype=torch.long, device=trainer.device)
             x = trainer.G(z, y).cpu()
             imgs_after.append(x)
+
+            # Save individual images per class
+            class_dir = os.path.join(after_dir, f"class_{cls}")
+            os.makedirs(class_dir, exist_ok=True)
+            for i in range(per_class):
+                save_image(x[i], os.path.join(class_dir, f"img_{i+1}.png"), normalize=True, value_range=(-1, 1))
+
         imgs_after = torch.cat(imgs_after, dim=0)
-        grid_after = make_grid(imgs_after, nrow=num_classes, normalize=True, value_range=(-1, 1))
-        os.makedirs(os.path.join(args.work_dir, "samples"), exist_ok=True)
-        from torchvision.utils import save_image as _save_image
-        _save_image(grid_after, os.path.join(args.work_dir, "samples", "after_unlearning.png"))
+        grid_after = make_grid(imgs_after, nrow=per_class, normalize=True, value_range=(-1, 1))
+        save_image(grid_after, os.path.join(after_dir, "grid_all_classes.png"))
     trainer.G.train()
 
     plt.figure(figsize=(12, 3))
     plt.axis('off')
-    plt.title('After Unlearning: 1 sample per class')
+    plt.title(f'After Unlearning: {per_class} samples per class')
     plt.imshow(grid_after.permute(1, 2, 0).numpy())
     plt.show()
 
