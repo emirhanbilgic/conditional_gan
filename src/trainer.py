@@ -10,6 +10,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision.utils import save_image, make_grid
 from tqdm import tqdm
+from torch.cuda.amp import GradScaler, autocast
 
 from .models import build_models, Generator, Discriminator
 from .utils import ensure_dir, save_checkpoint, sample_noise, set_seed
@@ -26,10 +27,15 @@ class TrainConfig:
     beta1: float = 0.5
     beta2: float = 0.999
     epochs: int = 50
-    num_workers: int = 4
-    sample_grid: int = 64
+    num_workers: int = 2
+    pin_memory: bool = True
+    sample_grid: int = 32
+    sample_interval: int = 2000  # steps; set <=0 to disable
+    keep_last: int = 3  # checkpoints to keep; set <=0 to keep all
+    save_optimizer: bool = False
     seed: int = 42
     device: str = "cuda"
+    amp: bool = True
 
 
 class CGANTrainer:
@@ -38,7 +44,14 @@ class CGANTrainer:
         self.cfg = cfg
         self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
 
-        self.train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True, drop_last=True)
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=cfg.num_workers,
+            pin_memory=cfg.pin_memory and self.device.type == "cuda",
+            drop_last=True,
+        )
         self.num_classes = num_classes
         self.G, self.D = build_models(z_dim=cfg.z_dim, num_classes=num_classes)
         self.G.to(self.device)
@@ -48,6 +61,10 @@ class CGANTrainer:
         self.opt_d = optim.Adam(self.D.parameters(), lr=cfg.lr_d, betas=(cfg.beta1, cfg.beta2))
 
         self.criterion = nn.BCEWithLogitsLoss()
+
+        # Mixed precision scaler (enabled only if CUDA and cfg.amp)
+        self.use_amp = bool(cfg.amp and torch.cuda.is_available())
+        self.scaler = GradScaler(enabled=self.use_amp)
 
         self.ckpt_dir = os.path.join(cfg.work_dir, "checkpoints")
         self.sample_dir = os.path.join(cfg.work_dir, "samples")
@@ -80,44 +97,73 @@ class CGANTrainer:
 
                 # Train D
                 self.opt_d.zero_grad(set_to_none=True)
-                z = sample_noise(bsz, self.cfg.z_dim, self.device)
-                fake = self.G(z, y).detach()
-                pred_real = self.D(real, y)
-                pred_fake = self.D(fake, y)
-                loss_d = self.criterion(pred_real, torch.ones_like(pred_real)) + \
-                         self.criterion(pred_fake, torch.zeros_like(pred_fake))
-                loss_d.backward()
-                self.opt_d.step()
+                with autocast(enabled=self.use_amp):
+                    z = sample_noise(bsz, self.cfg.z_dim, self.device)
+                    fake = self.G(z, y).detach()
+                    pred_real = self.D(real, y)
+                    pred_fake = self.D(fake, y)
+                    loss_d = self.criterion(pred_real, torch.ones_like(pred_real)) + \
+                             self.criterion(pred_fake, torch.zeros_like(pred_fake))
+                self.scaler.scale(loss_d).backward()
+                self.scaler.step(self.opt_d)
+                self.scaler.update()
 
                 # Train G
                 self.opt_g.zero_grad(set_to_none=True)
-                z = sample_noise(bsz, self.cfg.z_dim, self.device)
-                fake = self.G(z, y)
-                pred_fake = self.D(fake, y)
-                loss_g = self.criterion(pred_fake, torch.ones_like(pred_fake))
-                loss_g.backward()
-                self.opt_g.step()
+                with autocast(enabled=self.use_amp):
+                    z = sample_noise(bsz, self.cfg.z_dim, self.device)
+                    fake = self.G(z, y)
+                    pred_fake = self.D(fake, y)
+                    loss_g = self.criterion(pred_fake, torch.ones_like(pred_fake))
+                self.scaler.scale(loss_g).backward()
+                self.scaler.step(self.opt_g)
+                self.scaler.update()
 
-                if step % 500 == 0:
+                if self.cfg.sample_interval > 0 and (step % self.cfg.sample_interval == 0):
                     self._save_samples(step)
 
                 pbar.set_postfix({"loss_d": f"{loss_d.item():.3f}", "loss_g": f"{loss_g.item():.3f}"})
                 step += 1
 
             # Save checkpoint per epoch
-            save_checkpoint({
+            state = {
                 "G": self.G.state_dict(),
                 "D": self.D.state_dict(),
-                "opt_g": self.opt_g.state_dict(),
-                "opt_d": self.opt_d.state_dict(),
-                "epoch": epoch
-            }, os.path.join(self.ckpt_dir, f"epoch_{epoch+1:03d}.pt"))
+                "epoch": epoch,
+            }
+            if self.cfg.save_optimizer:
+                state["opt_g"] = self.opt_g.state_dict()
+                state["opt_d"] = self.opt_d.state_dict()
+            ckpt_path = os.path.join(self.ckpt_dir, f"epoch_{epoch+1:03d}.pt")
+            save_checkpoint(state, ckpt_path)
+
+            # Rotate old checkpoints to save disk
+            if self.cfg.keep_last and self.cfg.keep_last > 0:
+                try:
+                    files = sorted(
+                        [f for f in os.listdir(self.ckpt_dir) if f.startswith("epoch_") and f.endswith(".pt")]
+                    )
+                    excess = len(files) - self.cfg.keep_last
+                    for i in range(max(0, excess)):
+                        try:
+                            os.remove(os.path.join(self.ckpt_dir, files[i]))
+                        except OSError:
+                            pass
+                except Exception:
+                    pass
 
     def finetune_excluding_class(self, dataset_excluding_class: Dataset, epochs: int) -> None:
         """Unlearn a class by fine-tuning on data without that class.
         We continue training but the dataloader contains no samples of that class.
         """
-        loader = DataLoader(dataset_excluding_class, batch_size=self.cfg.batch_size, shuffle=True, num_workers=self.cfg.num_workers, pin_memory=True, drop_last=True)
+        loader = DataLoader(
+            dataset_excluding_class,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
+            num_workers=self.cfg.num_workers,
+            pin_memory=self.cfg.pin_memory and self.device.type == "cuda",
+            drop_last=True,
+        )
         step = 0
         for epoch in range(epochs):
             pbar = tqdm(loader, desc=f"Unlearn Epoch {epoch+1}/{epochs}")
@@ -128,25 +174,29 @@ class CGANTrainer:
 
                 # D
                 self.opt_d.zero_grad(set_to_none=True)
-                z = sample_noise(bsz, self.cfg.z_dim, self.device)
-                fake = self.G(z, y).detach()
-                pred_real = self.D(real, y)
-                pred_fake = self.D(fake, y)
-                loss_d = self.criterion(pred_real, torch.ones_like(pred_real)) + \
-                         self.criterion(pred_fake, torch.zeros_like(pred_fake))
-                loss_d.backward()
-                self.opt_d.step()
+                with autocast(enabled=self.use_amp):
+                    z = sample_noise(bsz, self.cfg.z_dim, self.device)
+                    fake = self.G(z, y).detach()
+                    pred_real = self.D(real, y)
+                    pred_fake = self.D(fake, y)
+                    loss_d = self.criterion(pred_real, torch.ones_like(pred_real)) + \
+                             self.criterion(pred_fake, torch.zeros_like(pred_fake))
+                self.scaler.scale(loss_d).backward()
+                self.scaler.step(self.opt_d)
+                self.scaler.update()
 
                 # G
                 self.opt_g.zero_grad(set_to_none=True)
-                z = sample_noise(bsz, self.cfg.z_dim, self.device)
-                fake = self.G(z, y)
-                pred_fake = self.D(fake, y)
-                loss_g = self.criterion(pred_fake, torch.ones_like(pred_fake))
-                loss_g.backward()
-                self.opt_g.step()
+                with autocast(enabled=self.use_amp):
+                    z = sample_noise(bsz, self.cfg.z_dim, self.device)
+                    fake = self.G(z, y)
+                    pred_fake = self.D(fake, y)
+                    loss_g = self.criterion(pred_fake, torch.ones_like(pred_fake))
+                self.scaler.scale(loss_g).backward()
+                self.scaler.step(self.opt_g)
+                self.scaler.update()
 
-                if step % 500 == 0:
+                if self.cfg.sample_interval > 0 and (step % self.cfg.sample_interval == 0):
                     self._save_samples(step)
 
                 pbar.set_postfix({"loss_d": f"{loss_d.item():.3f}", "loss_g": f"{loss_g.item():.3f}"})

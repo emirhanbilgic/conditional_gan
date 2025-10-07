@@ -20,16 +20,25 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Conditional GAN on CIFAR-10 with Unlearning")
     p.add_argument("--data_dir", type=str, required=True, help="CIFAR-10 root directory for torchvision cache")
     p.add_argument("--work_dir", type=str, required=True)
-    p.add_argument("--img_size", type=int, default=64)
-    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--img_size", type=int, default=32)
+    p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--z_dim", type=int, default=128)
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--unlearn_epochs", type=int, default=10)
-    p.add_argument("--fid_num_samples_per_class", type=int, default=1000)
+    p.add_argument("--fid_num_samples_per_class", type=int, default=200)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--unlearning_type", type=str, default="pure_finetuning", choices=["pure_finetuning", "fisher"], help="Unlearning strategy: pure_finetuning or fisher")
-    p.add_argument("--samples_per_class", type=int, default=5, help="Number of samples to generate per class for before/after snapshots")
+    p.add_argument("--samples_per_class", type=int, default=2, help="Number of samples to generate per class for before/after snapshots")
+    # Performance/memory toggles
+    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--pin_memory", type=int, default=1, help="1 to enable pin_memory when CUDA; 0 to disable")
+    p.add_argument("--amp", type=int, default=1, help="1 to enable mixed precision when CUDA; 0 to disable")
+    p.add_argument("--sample_interval", type=int, default=2000, help="Steps between training sample grids; <=0 disables")
+    p.add_argument("--keep_last", type=int, default=3, help="How many checkpoints to keep; <=0 keeps all")
+    p.add_argument("--save_optimizer", type=int, default=0, help="1 to include optimizer in checkpoints")
+    p.add_argument("--save_individual_samples", type=int, default=0, help="1 to save individual per-class images for snapshots")
+    p.add_argument("--show_plots", type=int, default=0, help="1 to display matplotlib figures")
     return p.parse_args()
 
 
@@ -52,6 +61,13 @@ def main() -> None:
         epochs=args.epochs,
         seed=args.seed,
         device=args.device,
+        num_workers=args.num_workers,
+        pin_memory=bool(args.pin_memory),
+        amp=bool(args.amp),
+        sample_grid=32,
+        sample_interval=args.sample_interval,
+        keep_last=args.keep_last,
+        save_optimizer=bool(args.save_optimizer),
     )
     trainer = CGANTrainer(train_ds, num_classes=num_classes, cfg=tcfg)
     trainer.train()
@@ -86,11 +102,12 @@ def main() -> None:
             x = trainer.G(z, y).cpu()
             imgs_before.append(x)
 
-            # Save individual images per class
-            class_dir = os.path.join(before_dir, f"class_{cls}")
-            os.makedirs(class_dir, exist_ok=True)
-            for i in range(per_class):
-                save_image(x[i], os.path.join(class_dir, f"img_{i+1}.png"), normalize=True, value_range=(-1, 1))
+            # Optional: save individual images per class
+            if args.save_individual_samples:
+                class_dir = os.path.join(before_dir, f"class_{cls}")
+                os.makedirs(class_dir, exist_ok=True)
+                for i in range(per_class):
+                    save_image(x[i], os.path.join(class_dir, f"img_{i+1}.png"), normalize=True, value_range=(-1, 1))
 
         imgs_before = torch.cat(imgs_before, dim=0)
         # Combined grid with nrow = samples per class, rows = classes
@@ -98,11 +115,12 @@ def main() -> None:
         save_image(grid_before, os.path.join(before_dir, "grid_all_classes.png"))
     trainer.G.train()
 
-    plt.figure(figsize=(12, 3))
-    plt.axis('off')
-    plt.title(f'Before Unlearning: {per_class} samples per class')
-    plt.imshow(grid_before.permute(1, 2, 0).numpy())
-    plt.show()
+    if args.show_plots:
+        plt.figure(figsize=(12, 3))
+        plt.axis('off')
+        plt.title(f'Before Unlearning: {per_class} samples per class')
+        plt.imshow(grid_before.permute(1, 2, 0).numpy())
+        plt.show()
 
     # 3) FID before unlearning
     fcfg = FIDConfig(
@@ -110,6 +128,7 @@ def main() -> None:
         num_samples_per_class=args.fid_num_samples_per_class,
         batch_size=max(32, args.batch_size // 2),
         device=args.device,
+        num_workers=max(1, args.num_workers // 2),
     )
     fid_eval = FIDEvaluator(trainer.G, num_classes=num_classes, cfg=fcfg)
     fid_before = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)
@@ -141,22 +160,24 @@ def main() -> None:
             x = trainer.G(z, y).cpu()
             imgs_after.append(x)
 
-            # Save individual images per class
-            class_dir = os.path.join(after_dir, f"class_{cls}")
-            os.makedirs(class_dir, exist_ok=True)
-            for i in range(per_class):
-                save_image(x[i], os.path.join(class_dir, f"img_{i+1}.png"), normalize=True, value_range=(-1, 1))
+            # Optional: save individual images per class
+            if args.save_individual_samples:
+                class_dir = os.path.join(after_dir, f"class_{cls}")
+                os.makedirs(class_dir, exist_ok=True)
+                for i in range(per_class):
+                    save_image(x[i], os.path.join(class_dir, f"img_{i+1}.png"), normalize=True, value_range=(-1, 1))
 
         imgs_after = torch.cat(imgs_after, dim=0)
         grid_after = make_grid(imgs_after, nrow=per_class, normalize=True, value_range=(-1, 1))
         save_image(grid_after, os.path.join(after_dir, "grid_all_classes.png"))
     trainer.G.train()
 
-    plt.figure(figsize=(12, 3))
-    plt.axis('off')
-    plt.title(f'After Unlearning: {per_class} samples per class')
-    plt.imshow(grid_after.permute(1, 2, 0).numpy())
-    plt.show()
+    if args.show_plots:
+        plt.figure(figsize=(12, 3))
+        plt.axis('off')
+        plt.title(f'After Unlearning: {per_class} samples per class')
+        plt.imshow(grid_after.permute(1, 2, 0).numpy())
+        plt.show()
 
     # 5) FID after unlearning
     fid_after = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)

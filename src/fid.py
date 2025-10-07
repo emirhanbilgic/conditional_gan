@@ -63,6 +63,7 @@ class FIDConfig:
     num_samples_per_class: int = 1000
     batch_size: int = 64
     device: str = "cuda"
+    num_workers: int = 2
 
 
 class FIDEvaluator:
@@ -76,7 +77,13 @@ class FIDEvaluator:
 
     @torch.no_grad()
     def _collect_acts_dataset(self, dataset: Dataset, per_class: bool = True) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
-        loader = DataLoader(dataset, batch_size=self.cfg.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        loader = DataLoader(
+            dataset,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            pin_memory=(self.device.type == "cuda"),
+        )
         acts_by_class: Dict[int, List[np.ndarray]] = {c: [] for c in range(self.num_classes)}
         for x, y in tqdm(loader, desc="Dataset activations"):
             x = x.to(self.device)
