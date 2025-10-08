@@ -207,7 +207,7 @@ class CGANTrainer:
         """Unlearn a class by Fisher pruning without further fine-tuning.
 
         We compute Fisher information diagonals on two subsets: forgotten (Df) and retained (Dr).
-        For each parameter, if Df/Dr > 2, we prune (zero) that weight. Otherwise we leave it untouched.
+        For each parameter, if Df/Dr > 15, we prune (zero) that weight. Otherwise we leave it untouched.
         If no weights exceed the threshold, we do nothing else.
         """
         device = self.device
@@ -305,7 +305,7 @@ class CGANTrainer:
         fisher_g_forgot, fisher_d_forgot = _compute_fisher_for_loader(forgotten_loader)
         fisher_g_retain, fisher_d_retain = _compute_fisher_for_loader(retained_loader)
 
-        def _prune_by_ratio(module: nn.Module, fisher_forgot: Dict[str, torch.Tensor], fisher_retain: Dict[str, torch.Tensor], threshold: float = 10.0) -> int:
+        def _prune_by_ratio(module: nn.Module, fisher_forgot: Dict[str, torch.Tensor], fisher_retain: Dict[str, torch.Tensor], threshold: float = 15.0) -> int:
             eps = 1e-8
             num_pruned = 0
             for name, param in module.named_parameters():

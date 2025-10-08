@@ -13,7 +13,7 @@ from datetime import datetime
 from .data import CIFAR10Config, load_cifar10_datasets
 from .trainer import TrainConfig, CGANTrainer
 from .fid import FIDConfig, FIDEvaluator
-from .utils import ensure_dir, write_json
+from .utils import ensure_dir, write_json, GradCAM, overlay_heatmap_on_images
 
 
 def parse_args() -> argparse.Namespace:
@@ -115,6 +115,26 @@ def main() -> None:
         save_image(grid_before, os.path.join(before_dir, "grid_all_classes.png"))
     trainer.G.train()
 
+    # Grad-CAMs before unlearning (through Discriminator)
+    # Target the last conv layer in D.features
+    d_target_layer = trainer.D.features[-1]
+    gradcam = GradCAM(trainer.D, d_target_layer, device=trainer.device)
+    trainer.D.eval()
+    # Compute D scores for generated images and backprop to get CAMs
+    with torch.no_grad():
+        imgs_b = imgs_before.to(trainer.device)
+        labels_b = torch.cat([torch.full((per_class,), c, device=trainer.device, dtype=torch.long) for c in range(num_classes)], dim=0)
+    imgs_b.requires_grad_(True)
+    pred_b = trainer.D(imgs_b, labels_b)
+    cam_b = gradcam.compute_heatmap(pred_b.sum())  # (B,1,H',W') w.r.t last conv spatial size
+    # Upsample CAMs to image size and overlay
+    cam_b_up = torch.nn.functional.interpolate(cam_b, size=imgs_b.shape[-2:], mode="bilinear", align_corners=False)
+    overlays_b = overlay_heatmap_on_images(imgs_b.detach(), cam_b_up.detach(), alpha=0.5).cpu()
+    grid_cam_b = make_grid(overlays_b, nrow=per_class, normalize=True)
+    save_image(grid_cam_b, os.path.join(before_dir, "gradcam_overlay_grid.png"))
+    trainer.D.train()
+    gradcam.remove_hooks()
+
     if args.show_plots:
         plt.figure(figsize=(12, 3))
         plt.axis('off')
@@ -171,6 +191,23 @@ def main() -> None:
         grid_after = make_grid(imgs_after, nrow=per_class, normalize=True, value_range=(-1, 1))
         save_image(grid_after, os.path.join(after_dir, "grid_all_classes.png"))
     trainer.G.train()
+
+    # Grad-CAMs after unlearning
+    d_target_layer = trainer.D.features[-1]
+    gradcam = GradCAM(trainer.D, d_target_layer, device=trainer.device)
+    trainer.D.eval()
+    with torch.no_grad():
+        imgs_a = imgs_after.to(trainer.device)
+        labels_a = torch.cat([torch.full((per_class,), c, device=trainer.device, dtype=torch.long) for c in range(num_classes)], dim=0)
+    imgs_a.requires_grad_(True)
+    pred_a = trainer.D(imgs_a, labels_a)
+    cam_a = gradcam.compute_heatmap(pred_a.sum())
+    cam_a_up = torch.nn.functional.interpolate(cam_a, size=imgs_a.shape[-2:], mode="bilinear", align_corners=False)
+    overlays_a = overlay_heatmap_on_images(imgs_a.detach(), cam_a_up.detach(), alpha=0.5).cpu()
+    grid_cam_a = make_grid(overlays_a, nrow=per_class, normalize=True)
+    save_image(grid_cam_a, os.path.join(after_dir, "gradcam_overlay_grid.png"))
+    trainer.D.train()
+    gradcam.remove_hooks()
 
     if args.show_plots:
         plt.figure(figsize=(12, 3))
