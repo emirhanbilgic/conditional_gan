@@ -117,7 +117,10 @@ def main() -> None:
 
     # Grad-CAMs before unlearning (through Discriminator)
     # Target the last conv layer in D.features
-    d_target_layer = trainer.D.features[-1]
+    # Target the last convolutional feature map layer, not an activation
+    # Discriminator.features layout: [conv, lrelu, conv, bn, lrelu, conv, bn, lrelu, conv, lrelu]
+    # We want the last conv before projection, which is index 8 (0-based) for conv2d
+    d_target_layer = trainer.D.features[8]
     gradcam = GradCAM(trainer.D, d_target_layer, device=trainer.device)
     trainer.D.eval()
     # Compute D scores for generated images and backprop to get CAMs
@@ -193,7 +196,7 @@ def main() -> None:
     trainer.G.train()
 
     # Grad-CAMs after unlearning
-    d_target_layer = trainer.D.features[-1]
+    d_target_layer = trainer.D.features[8]
     gradcam = GradCAM(trainer.D, d_target_layer, device=trainer.device)
     trainer.D.eval()
     with torch.no_grad():

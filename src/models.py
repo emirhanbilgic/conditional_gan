@@ -72,15 +72,15 @@ class Discriminator(nn.Module):
         # Projection discriminator
         self.features = nn.Sequential(
             nn.Conv2d(img_channels, base_channels, 4, 2, 1),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Conv2d(base_channels, base_channels * 2, 4, 2, 1),
             nn.BatchNorm2d(base_channels * 2),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Conv2d(base_channels * 2, base_channels * 4, 4, 2, 1),
             nn.BatchNorm2d(base_channels * 4),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Conv2d(base_channels * 4, base_channels * 8, 4, 2, 1),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),
         )
         self.conv_out = nn.Conv2d(base_channels * 8, 1, 4, 1, 0)
         self.embed = nn.Embedding(num_classes, base_channels * 8)

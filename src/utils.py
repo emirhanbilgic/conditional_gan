@@ -62,10 +62,11 @@ class GradCAM:
         self._grads = None
 
         def fwd_hook(module, inp, out):
-            self._activations = out.detach()
+            # clone to avoid in-place issues with autograd views
+            self._activations = out.detach().clone()
 
         def bwd_hook(module, grad_in, grad_out):
-            self._grads = grad_out[0].detach()
+            self._grads = grad_out[0].detach().clone()
 
         # register hooks
         self._fwd_handle = self.target_layer.register_forward_hook(fwd_hook)
