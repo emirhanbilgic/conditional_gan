@@ -21,6 +21,9 @@ def load_pretrained_gan(gan_type: str = "biggan", resolution: int | None = None)
     kwargs = {"gan_type": gan_type}
     if resolution is not None:
         kwargs["resolution"] = resolution
+    # BigGAN interfaces in some versions don't accept 'resolution' kwarg
+    if "biggan" in str(gan_type).lower():
+        kwargs.pop("resolution", None)
     try:
         G = make_gan(**kwargs)
     except TypeError as te:
