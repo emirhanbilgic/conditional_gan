@@ -9,7 +9,14 @@ def load_pretrained_gan(gan_type: str = "biggan", resolution: int | None = None)
 
     Returns a callable generator module `G` with methods `sample_class` and `sample_latent` if available.
     """
-    from pytorch_pretrained_gans import make_gan
+    try:
+        from pytorch_pretrained_gans import make_gan
+    except Exception as e:
+        raise ImportError(
+            "pytorch_pretrained_gans is not installed. Run: \n"
+            "pip install --no-cache-dir git+https://github.com/lukemelas/pytorch-pretrained-gans\n"
+            "If on Kaggle, prefix with: pip install -q --no-deps --no-cache-dir git+https://github.com/lukemelas/pytorch-pretrained-gans"
+        ) from e
 
     if resolution is None:
         G = make_gan(gan_type=gan_type)

@@ -69,4 +69,10 @@ This will:
 - Save a per-class grid to `work_dir/samples/.../grid_all_classes.png`.
 - Compute per-class and overall FID versus CIFAR-10 and write JSON to `work_dir/metrics/fid_pretrained.json`.
 
+If your environment doesn't have the package, install first (e.g., on Kaggle):
+
+```bash
+pip install -q --no-deps --no-cache-dir git+https://github.com/lukemelas/pytorch-pretrained-gans
+```
+
 
