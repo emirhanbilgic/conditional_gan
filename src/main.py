@@ -12,8 +12,9 @@ from datetime import datetime
 
 from .data import CIFAR10Config, load_cifar10_datasets
 from .trainer import TrainConfig, CGANTrainer
-from .fid import FIDConfig, FIDEvaluator
+from .fid import FIDConfig, FIDEvaluator, FIDEvaluatorFromSampler
 from .utils import ensure_dir, write_json, GradCAM, overlay_heatmap_on_images
+from .pretrained import load_pretrained_gan, make_conditional_sampler
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_optimizer", type=int, default=0, help="1 to include optimizer in checkpoints")
     p.add_argument("--save_individual_samples", type=int, default=0, help="1 to save individual per-class images for snapshots")
     p.add_argument("--show_plots", type=int, default=0, help="1 to display matplotlib figures")
+    # Pretrained options
+    p.add_argument("--use_pretrained", type=int, default=0, help="1 to use a pretrained GAN instead of training")
+    p.add_argument("--pretrained_gan_type", type=str, default="self_conditioned", help="GAN type for pytorch-pretrained-gans, e.g., biggan or self_conditioned")
+    p.add_argument("--pretrained_resolution", type=int, default=256, help="Resolution for pretrained GAN, if supported")
     return p.parse_args()
 
 
@@ -51,6 +56,66 @@ def main() -> None:
     c_cfg = CIFAR10Config(data_dir=args.data_dir, img_size=args.img_size, train_download=True, test_download=True, seed=args.seed)
     train_ds, val_ds, _, class_names = load_cifar10_datasets(c_cfg)
     num_classes = 10
+
+    # Optional: Pretrained-only sampling + FID flow
+    if int(args.use_pretrained) == 1:
+        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+        Gp = load_pretrained_gan(gan_type=args.pretrained_gan_type, resolution=args.pretrained_resolution)
+        sampler = make_conditional_sampler(Gp, device)
+
+        # Create a unique directory per trial
+        samples_root = os.path.join(args.work_dir, "samples")
+        os.makedirs(samples_root, exist_ok=True)
+        trial_tag = datetime.now().strftime("%Y%m%d-%H%M%S")
+        trial_base = f"trial_{trial_tag}_seed{args.seed}_pretrained_{args.pretrained_gan_type}"
+        trial_dir = os.path.join(samples_root, trial_base)
+        if os.path.exists(trial_dir):
+            suffix = 1
+            while True:
+                candidate = os.path.join(samples_root, f"{trial_base}_{suffix:03d}")
+                if not os.path.exists(candidate):
+                    trial_dir = candidate
+                    break
+                suffix += 1
+        os.makedirs(trial_dir, exist_ok=True)
+
+        # Generate samples: N per CIFAR-10 class index (0..9)
+        with torch.no_grad():
+            imgs_all = []
+            per_class = int(max(1, args.samples_per_class))
+            before_dir = os.path.join(trial_dir, "pretrained_samples")
+            os.makedirs(before_dir, exist_ok=True)
+            for cls in range(num_classes):
+                z = torch.randn(per_class, args.z_dim, device=device)
+                y = torch.full((per_class,), cls, dtype=torch.long, device=device)
+                x = sampler(z, y).cpu()
+                imgs_all.append(x)
+                if args.save_individual_samples:
+                    class_dir = os.path.join(before_dir, f"class_{cls}")
+                    os.makedirs(class_dir, exist_ok=True)
+                    for i in range(per_class):
+                        save_image(x[i], os.path.join(class_dir, f"img_{i+1}.png"), normalize=True, value_range=(-1, 1))
+            imgs_all = torch.cat(imgs_all, dim=0)
+            grid = make_grid(imgs_all, nrow=per_class, normalize=True, value_range=(-1, 1))
+            save_image(grid, os.path.join(before_dir, "grid_all_classes.png"))
+
+        # FID (per-class and overall)
+        fcfg = FIDConfig(
+            work_dir=args.work_dir,
+            num_samples_per_class=args.fid_num_samples_per_class,
+            batch_size=max(32, args.batch_size // 2),
+            device=args.device,
+            num_workers=max(1, args.num_workers // 2),
+        )
+        fid_eval = FIDEvaluatorFromSampler(sampler, num_classes=num_classes, cfg=fcfg)
+        fid_scores = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)
+        write_json(fid_scores, os.path.join(args.work_dir, "metrics", "fid_pretrained.json"))
+
+        print("CIFAR-10 classes (fixed order):")
+        print(class_names)
+        print("FID (pretrained):")
+        print(json.dumps(fid_scores, indent=2))
+        return
 
     # 2) Train CGAN
     tcfg = TrainConfig(

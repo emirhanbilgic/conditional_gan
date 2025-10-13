@@ -132,3 +132,72 @@ class FIDEvaluator:
         return per_class_fid
 
 
+class FIDEvaluatorFromSampler:
+    """FID evaluator that uses a provided sampling function instead of a local generator.
+
+    The sampler must accept two tensors `(z, y)` on the current device and return images in `[-1, 1]`.
+    """
+
+    def __init__(self, sampler, num_classes: int, cfg: FIDConfig):
+        self.sampler = sampler
+        self.num_classes = num_classes
+        self.cfg = cfg
+        self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+        self.embedder = InceptionEmbedder(self.device)
+        ensure_dir(os.path.join(cfg.work_dir, "metrics"))
+
+    @torch.no_grad()
+    def _collect_acts_generator(self, z_dim: int) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+        per_class = self.cfg.num_samples_per_class
+        collected: Dict[int, List[np.ndarray]] = {c: [] for c in range(self.num_classes)}
+        for cls in range(self.num_classes):
+            remaining = per_class
+            while remaining > 0:
+                bsz = min(self.cfg.batch_size, remaining)
+                z = torch.randn(bsz, z_dim, device=self.device)
+                y = torch.full((bsz,), cls, dtype=torch.long, device=self.device)
+                x = self.sampler(z, y)
+                feats = self.embedder.get_activations(x)
+                collected[cls].append(feats.cpu().numpy())
+                remaining -= bsz
+        stats = {c: _compute_stats(np.concatenate(v, axis=0)) for c, v in collected.items() if len(v) > 0}
+        return stats
+
+    @torch.no_grad()
+    def _collect_acts_dataset(self, dataset: Dataset, per_class: bool = True) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+        loader = DataLoader(
+            dataset,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            pin_memory=(self.device.type == "cuda"),
+        )
+        acts_by_class: Dict[int, List[np.ndarray]] = {c: [] for c in range(self.num_classes)}
+        for x, y in tqdm(loader, desc="Dataset activations"):
+            x = x.to(self.device)
+            y = y.to(self.device)
+            feats = self.embedder.get_activations(x)
+            feats = feats.cpu().numpy()
+            for i in range(len(y)):
+                acts_by_class[int(y[i].item())].append(feats[i:i+1])
+        stats = {c: _compute_stats(np.concatenate(v, axis=0)) for c, v in acts_by_class.items() if len(v) > 0}
+        return stats
+
+    def compute_fid(self, dataset: Dataset, z_dim: int) -> Dict[str, float]:
+        real_stats = self._collect_acts_dataset(dataset)
+        fake_stats = self._collect_acts_generator(z_dim)
+        per_class_fid: Dict[str, float] = {}
+        vals: List[float] = []
+        for c in range(self.num_classes):
+            if c not in real_stats or c not in fake_stats:
+                continue
+            mu_r, sig_r = real_stats[c]
+            mu_f, sig_f = fake_stats[c]
+            fid = _compute_frechet_distance(mu_r, sig_r, mu_f, sig_f)
+            per_class_fid[f"class_{c}"] = float(fid)
+            vals.append(fid)
+        if len(vals) > 0:
+            per_class_fid["overall_mean"] = float(np.mean(vals))
+        return per_class_fid
+
+
