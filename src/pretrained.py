@@ -18,11 +18,18 @@ def load_pretrained_gan(gan_type: str = "biggan", resolution: int | None = None)
             "If on Kaggle, prefix with: pip install -q --no-deps --no-cache-dir git+https://github.com/lukemelas/pytorch-pretrained-gans"
         ) from e
 
+    kwargs = {"gan_type": gan_type}
+    if resolution is not None:
+        kwargs["resolution"] = resolution
     try:
-        if resolution is None:
-            G = make_gan(gan_type=gan_type)
+        G = make_gan(**kwargs)
+    except TypeError as te:
+        # Some installed versions do not accept 'resolution'; retry without it
+        if "resolution" in kwargs:
+            kwargs.pop("resolution", None)
+            G = make_gan(**kwargs)
         else:
-            G = make_gan(gan_type=gan_type, resolution=resolution)
+            raise
     except NotImplementedError as nie:
         if gan_type in {"self_conditioned", "self-conditioned", "scgan"}:
             raise NotImplementedError(
