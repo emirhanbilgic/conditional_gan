@@ -10,7 +10,12 @@ import matplotlib.pyplot as plt
 from torchvision.utils import make_grid, save_image
 from datetime import datetime
 
-from .data import CIFAR10Config, load_cifar10_datasets
+from .data import (
+    CIFAR10Config,
+    load_cifar10_datasets,
+    ImageNetSubsetConfig,
+    load_imagenet_datasets,
+)
 from .trainer import TrainConfig, CGANTrainer
 from .fid import FIDConfig, FIDEvaluator, FIDEvaluatorFromSampler
 from .utils import ensure_dir, write_json, GradCAM, overlay_heatmap_on_images
@@ -44,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use_pretrained", type=int, default=0, help="1 to use a pretrained GAN instead of training")
     p.add_argument("--pretrained_gan_type", type=str, default="self_conditioned", help="GAN type for pytorch-pretrained-gans, e.g., biggan or self_conditioned")
     p.add_argument("--pretrained_resolution", type=int, default=256, help="Resolution for pretrained GAN, if supported")
+    # Dataset switch: CIFAR-10 vs ImageNet-like subset
+    p.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "imagenet_subset"], help="Select dataset source")
+    p.add_argument("--imagenet_classes", type=str, default="", help="Comma-separated class names to select (ImageFolder subdir names). If empty, auto-select first 10.")
+    p.add_argument("--auto_select_k", type=int, default=10, help="When using imagenet_subset and no class list provided, pick first K classes deterministically")
+    p.add_argument("--unlearn_label", type=int, default=0, help="Which remapped label [0..K-1] to unlearn")
+    p.add_argument("--imagenet_biggan_indices", type=str, default="", help="Comma-separated BigGAN class indices aligned with selected class order; used when --use_pretrained=1 with imagenet_subset")
     return p.parse_args()
 
 
@@ -51,17 +62,48 @@ def main() -> None:
     args = parse_args()
     ensure_dir(args.work_dir)
 
-    # 1) Load CIFAR-10 datasets
+    # 1) Load dataset (CIFAR-10 or ImageNet-like subset)
     os.makedirs(args.data_dir, exist_ok=True)
-    c_cfg = CIFAR10Config(data_dir=args.data_dir, img_size=args.img_size, train_download=True, test_download=True, seed=args.seed)
-    train_ds, val_ds, _, class_names = load_cifar10_datasets(c_cfg)
-    num_classes = 10
+    if args.dataset == "cifar10":
+        c_cfg = CIFAR10Config(data_dir=args.data_dir, img_size=args.img_size, train_download=True, test_download=True, seed=args.seed)
+        train_ds, val_ds, _, class_names = load_cifar10_datasets(c_cfg)
+        num_classes = 10
+    else:
+        selected = [s.strip() for s in args.imagenet_classes.split(",") if len(s.strip()) > 0]
+        i_cfg = ImageNetSubsetConfig(
+            data_dir=args.data_dir,
+            selected_class_names=selected if len(selected) > 0 else None,
+            img_size=args.img_size,
+            auto_select_k=args.auto_select_k,
+            seed=args.seed,
+        )
+        train_ds, val_ds, orig_idx_to_new, class_names = load_imagenet_datasets(i_cfg)
+        num_classes = len(class_names)
 
     # Optional: Pretrained-only sampling + FID flow
     if int(args.use_pretrained) == 1:
         device = torch.device(args.device if torch.cuda.is_available() else "cpu")
         Gp = load_pretrained_gan(gan_type=args.pretrained_gan_type, resolution=args.pretrained_resolution)
-        sampler = make_conditional_sampler(Gp, device)
+        base_sampler = make_conditional_sampler(Gp, device)
+
+        # Optional: map remapped labels [0..K-1] to BigGAN's global class indices when using imagenet_subset
+        mapping_new_to_biggan = None
+        if args.dataset == "imagenet_subset" and isinstance(class_names, list):
+            if isinstance(args.imagenet_biggan_indices, str) and len(args.imagenet_biggan_indices.strip()) > 0:
+                try:
+                    mapping_new_to_biggan = [int(x.strip()) for x in args.imagenet_biggan_indices.split(",")]
+                except Exception:
+                    mapping_new_to_biggan = None
+            # Fallback: if not provided, assume identity for first K classes (may mismatch semantics)
+            if mapping_new_to_biggan is not None and len(mapping_new_to_biggan) != num_classes:
+                raise ValueError("--imagenet_biggan_indices length must equal number of selected classes")
+
+        def sampler(z: torch.Tensor, y_new: torch.Tensor) -> torch.Tensor:
+            if mapping_new_to_biggan is None:
+                return base_sampler(z, y_new)
+            with torch.no_grad():
+                y_mapped = torch.tensor([mapping_new_to_biggan[int(yy.item())] for yy in y_new], device=y_new.device, dtype=torch.long)
+            return base_sampler(z, y_mapped)
 
         # Create a unique directory per trial
         samples_root = os.path.join(args.work_dir, "samples")
@@ -79,7 +121,7 @@ def main() -> None:
                 suffix += 1
         os.makedirs(trial_dir, exist_ok=True)
 
-        # Generate samples: N per CIFAR-10 class index (0..9)
+        # Generate samples: N per selected class index (0..K-1)
         with torch.no_grad():
             imgs_all = []
             per_class = int(max(1, args.samples_per_class))
@@ -111,7 +153,7 @@ def main() -> None:
         fid_scores = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)
         write_json(fid_scores, os.path.join(args.work_dir, "metrics", "fid_pretrained.json"))
 
-        print("CIFAR-10 classes (fixed order):")
+        print("Selected classes (fixed order):")
         print(class_names)
         print("FID (pretrained):")
         print(json.dumps(fid_scores, indent=2))
@@ -222,8 +264,8 @@ def main() -> None:
     fid_before = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)
     write_json(fid_before, os.path.join(args.work_dir, "metrics", "fid_before.json"))
 
-    # 4) Unlearn the first selected class (c1)
-    c1_new = 0  # by construction, the first selected class is mapped to 0
+    # 4) Unlearn the selected class label
+    c1_new = int(args.unlearn_label)
     # filter out all samples equal to c1_new
     indices = [i for i in range(len(train_ds)) if int(train_ds[i][1]) != int(c1_new)]
     from torch.utils.data import Subset
@@ -289,7 +331,7 @@ def main() -> None:
     write_json(fid_after, os.path.join(args.work_dir, "metrics", "fid_after.json"))
 
     # 6) Print summary
-    print("CIFAR-10 classes (fixed order):")
+    print("Selected classes (fixed order):")
     print(class_names)
     print("FID before unlearning:")
     print(json.dumps(fid_before, indent=2))
