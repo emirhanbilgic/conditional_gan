@@ -6,6 +6,7 @@ import json
 from typing import List
 
 import torch
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from torchvision.utils import make_grid, save_image
 from datetime import datetime
@@ -19,7 +20,13 @@ from .data import (
 from .trainer import TrainConfig, CGANTrainer
 from .fid import FIDConfig, FIDEvaluator, FIDEvaluatorFromSampler
 from .utils import ensure_dir, write_json, GradCAM, overlay_heatmap_on_images
-from .pretrained import load_pretrained_gan, make_conditional_sampler, fisher_prune_generator_with_classifier
+from .pretrained import (
+    load_pretrained_gan,
+    make_conditional_sampler,
+    fisher_prune_generator_with_classifier,
+    _build_imagenet_classifier,
+    _imagenet_preprocess,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -146,6 +153,34 @@ def main() -> None:
             grid = make_grid(imgs_all, nrow=per_class, normalize=True, value_range=(-1, 1))
             save_image(grid, os.path.join(before_dir, "grid_all_classes.png"))
 
+        # Grad-CAM overlays (before unlearning) using pretrained ImageNet classifier
+        try:
+            clf = _build_imagenet_classifier(device)
+            # Target last conv in ResNet-50
+            try:
+                target_layer = clf.layer4[-1].conv3
+            except Exception:
+                target_layer = clf.layer4[2].conv3
+            gradcam = GradCAM(clf, target_layer, device=device)
+            imgs_b = imgs_all.to(device)
+            # Build target ImageNet label vector per image
+            labels_list = []
+            for new_lbl in range(num_classes):
+                mapped = int(mapping_new_to_biggan[new_lbl]) if mapping_new_to_biggan is not None else int(new_lbl)
+                labels_list.extend([mapped] * per_class)
+            labels_b = torch.tensor(labels_list, device=device, dtype=torch.long)
+            imgs_b.requires_grad_(True)
+            logits_b = clf(_imagenet_preprocess(imgs_b))
+            score_b = logits_b.gather(1, labels_b.view(-1, 1)).sum()
+            cam_b = gradcam.compute_heatmap(score_b)
+            cam_b_up = torch.nn.functional.interpolate(cam_b, size=imgs_b.shape[-2:], mode="bilinear", align_corners=False)
+            overlays_b = overlay_heatmap_on_images(imgs_b.detach(), cam_b_up.detach(), alpha=0.5).cpu()
+            grid_cam_b = make_grid(overlays_b, nrow=per_class, normalize=True)
+            save_image(grid_cam_b, os.path.join(before_dir, "gradcam_overlay_grid.png"))
+            gradcam.remove_hooks()
+        except Exception:
+            pass
+
         # FID (per-class and overall) BEFORE unlearning
         fcfg = FIDConfig(
             work_dir=args.work_dir,
@@ -192,6 +227,51 @@ def main() -> None:
                 with torch.no_grad():
                     y_mapped = torch.tensor([mapping_new_to_biggan[int(yy.item())] for yy in y_new], device=y_new.device, dtype=torch.long)
                 return base_sampler_after(z, y_mapped)
+
+            # Generate samples after unlearning and save grids + Grad-CAM overlays
+            with torch.no_grad():
+                imgs_after = []
+                per_class = int(max(1, args.samples_per_class))
+                after_dir = os.path.join(trial_dir, "pretrained_after_unlearning")
+                os.makedirs(after_dir, exist_ok=True)
+                for cls in range(num_classes):
+                    z = torch.randn(per_class, args.z_dim, device=device)
+                    y = torch.full((per_class,), cls, dtype=torch.long, device=device)
+                    x = sampler_after(z, y).cpu()
+                    imgs_after.append(x)
+                    if args.save_individual_samples:
+                        class_dir = os.path.join(after_dir, f"class_{cls}")
+                        os.makedirs(class_dir, exist_ok=True)
+                        for i in range(per_class):
+                            save_image(x[i], os.path.join(class_dir, f"img_{i+1}.png"), normalize=True, value_range=(-1, 1))
+                imgs_after = torch.cat(imgs_after, dim=0)
+                grid_after = make_grid(imgs_after, nrow=per_class, normalize=True, value_range=(-1, 1))
+                save_image(grid_after, os.path.join(after_dir, "grid_all_classes.png"))
+
+            try:
+                clf = _build_imagenet_classifier(device)
+                try:
+                    target_layer = clf.layer4[-1].conv3
+                except Exception:
+                    target_layer = clf.layer4[2].conv3
+                gradcam = GradCAM(clf, target_layer, device=device)
+                imgs_a = imgs_after.to(device)
+                labels_list_a = []
+                for new_lbl in range(num_classes):
+                    mapped = int(mapping_new_to_biggan[new_lbl]) if mapping_new_to_biggan is not None else int(new_lbl)
+                    labels_list_a.extend([mapped] * per_class)
+                labels_a = torch.tensor(labels_list_a, device=device, dtype=torch.long)
+                imgs_a.requires_grad_(True)
+                logits_a = clf(_imagenet_preprocess(imgs_a))
+                score_a = logits_a.gather(1, labels_a.view(-1, 1)).sum()
+                cam_a = gradcam.compute_heatmap(score_a)
+                cam_a_up = torch.nn.functional.interpolate(cam_a, size=imgs_a.shape[-2:], mode="bilinear", align_corners=False)
+                overlays_a = overlay_heatmap_on_images(imgs_a.detach(), cam_a_up.detach(), alpha=0.5).cpu()
+                grid_cam_a = make_grid(overlays_a, nrow=per_class, normalize=True)
+                save_image(grid_cam_a, os.path.join(after_dir, "gradcam_overlay_grid.png"))
+                gradcam.remove_hooks()
+            except Exception:
+                pass
 
             # FID AFTER unlearning
             fid_eval_after = FIDEvaluatorFromSampler(sampler_after, num_classes=num_classes, cfg=fcfg)
