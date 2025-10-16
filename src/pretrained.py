@@ -150,6 +150,8 @@ def fisher_prune_generator_with_classifier(
     Returns: (num_pruned_elements)
     """
     clf = _build_imagenet_classifier(device)
+    for p in clf.parameters():
+        p.requires_grad_(False)
     G = G.to(device)
     G.train()  # ensure gradients can flow
 
@@ -177,17 +179,26 @@ def fisher_prune_generator_with_classifier(
             return accum
         while batches < max_batches:
             bsz = batch_size
-            # Sample uniform classes from the given set
-            y = torch.tensor([labels[i % len(labels)] for i in range(bsz)], device=device, dtype=torch.long)
-            z = torch.randn(bsz, z_dim, device=device)
-            G.zero_grad(set_to_none=True)
-            # forward through G
-            x = G(z=z, y=y)
-            # classifier loss on target labels (ImageNet indices)
-            logits = clf(_imagenet_preprocess(x))
-            loss = F.cross_entropy(logits, y)
-            loss.backward()
-            _accumulate(G, accum)
+            # Process in micro-batches to reduce peak memory
+            mbsz = max(1, min(4, bsz))
+            num_micro = (bsz + mbsz - 1) // mbsz
+            for m in range(num_micro):
+                cur = min(mbsz, bsz - m * mbsz)
+                # Sample uniform classes from the given set
+                y = torch.tensor([labels[i % len(labels)] for i in range(cur)], device=device, dtype=torch.long)
+                z = torch.randn(cur, z_dim, device=device)
+                G.zero_grad(set_to_none=True)
+                # forward through G and classifier with optional autocast
+                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                    x = G(z=z, y=y)
+                    logits = clf(_imagenet_preprocess(x))
+                    loss = F.cross_entropy(logits, y)
+                loss.backward()
+                _accumulate(G, accum)
+                # Release activations early
+                del x, logits, loss, z, y
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             batches += 1
         return _normalize(accum, float(max(1, batches)))
 
