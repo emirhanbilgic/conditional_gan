@@ -19,7 +19,7 @@ from .data import (
 from .trainer import TrainConfig, CGANTrainer
 from .fid import FIDConfig, FIDEvaluator, FIDEvaluatorFromSampler
 from .utils import ensure_dir, write_json, GradCAM, overlay_heatmap_on_images
-from .pretrained import load_pretrained_gan, make_conditional_sampler
+from .pretrained import load_pretrained_gan, make_conditional_sampler, fisher_prune_generator_with_classifier
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use_pretrained", type=int, default=0, help="1 to use a pretrained GAN instead of training")
     p.add_argument("--pretrained_gan_type", type=str, default="self_conditioned", help="GAN type for pytorch-pretrained-gans, e.g., biggan or self_conditioned")
     p.add_argument("--pretrained_resolution", type=int, default=256, help="Resolution for pretrained GAN, if supported")
+    p.add_argument("--pretrained_unlearn", type=int, default=0, help="1 to apply Fisher pruning unlearning on the pretrained GAN itself")
+    p.add_argument("--pretrained_unlearn_label", type=int, default=0, help="Label [0..K-1] to unlearn in pretrained mode (maps via --imagenet_biggan_indices if provided)")
+    p.add_argument("--pretrained_fisher_batches", type=int, default=100, help="Max batches per side for Fisher in pretrained mode")
+    p.add_argument("--pretrained_fisher_batch_size", type=int, default=32, help="Batch size for Fisher accumulation in pretrained mode")
+    p.add_argument("--pretrained_fisher_threshold", type=float, default=15.0, help="Threshold on Fisher ratio for pruning in pretrained mode")
     # Dataset switch: CIFAR-10 vs ImageNet-like subset
     p.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "imagenet_subset"], help="Select dataset source")
     p.add_argument("--imagenet_classes", type=str, default="", help="Comma-separated class names to select (ImageFolder subdir names). If empty, auto-select first 10.")
@@ -141,7 +146,7 @@ def main() -> None:
             grid = make_grid(imgs_all, nrow=per_class, normalize=True, value_range=(-1, 1))
             save_image(grid, os.path.join(before_dir, "grid_all_classes.png"))
 
-        # FID (per-class and overall)
+        # FID (per-class and overall) BEFORE unlearning
         fcfg = FIDConfig(
             work_dir=args.work_dir,
             num_samples_per_class=args.fid_num_samples_per_class,
@@ -150,13 +155,61 @@ def main() -> None:
             num_workers=max(1, args.num_workers // 2),
         )
         fid_eval = FIDEvaluatorFromSampler(sampler, num_classes=num_classes, cfg=fcfg)
-        fid_scores = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)
-        write_json(fid_scores, os.path.join(args.work_dir, "metrics", "fid_pretrained.json"))
+        fid_pre = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)
+        write_json(fid_pre, os.path.join(args.work_dir, "metrics", "fid_pretrained_before.json"))
+
+        # Optional: unlearn one label directly on pretrained GAN via Fisher pruning
+        if int(args.pretrained_unlearn) == 1:
+            # Map the selected new label to BigGAN global label if mapping provided
+            target_new = int(args.pretrained_unlearn_label)
+            if mapping_new_to_biggan is None:
+                forgotten_biggan = target_new
+            else:
+                forgotten_biggan = int(mapping_new_to_biggan[target_new])
+            retained_biggan = []
+            for new_lbl in range(num_classes):
+                if new_lbl == target_new:
+                    continue
+                retained_biggan.append(int(mapping_new_to_biggan[new_lbl] if mapping_new_to_biggan is not None else new_lbl))
+
+            pruned_g, _ = fisher_prune_generator_with_classifier(
+                G=Gp,
+                forgotten_biggan_label=forgotten_biggan,
+                retained_biggan_labels=retained_biggan,
+                z_dim=args.z_dim,
+                device=device,
+                max_batches=int(args.pretrained_fisher_batches),
+                batch_size=int(args.pretrained_fisher_batch_size),
+                threshold=float(args.pretrained_fisher_threshold),
+            )
+            print(f"Pretrained unlearning: pruned elements in G = {pruned_g}")
+
+            # Re-wrap sampler to use updated Gp
+            base_sampler_after = make_conditional_sampler(Gp, device)
+            def sampler_after(z: torch.Tensor, y_new: torch.Tensor) -> torch.Tensor:
+                if mapping_new_to_biggan is None:
+                    return base_sampler_after(z, y_new)
+                with torch.no_grad():
+                    y_mapped = torch.tensor([mapping_new_to_biggan[int(yy.item())] for yy in y_new], device=y_new.device, dtype=torch.long)
+                return base_sampler_after(z, y_mapped)
+
+            # FID AFTER unlearning
+            fid_eval_after = FIDEvaluatorFromSampler(sampler_after, num_classes=num_classes, cfg=fcfg)
+            fid_post = fid_eval_after.compute_fid(val_ds, z_dim=args.z_dim)
+            write_json(fid_post, os.path.join(args.work_dir, "metrics", "fid_pretrained_after.json"))
+
+            print("Selected classes (fixed order):")
+            print(class_names)
+            print("FID (pretrained before):")
+            print(json.dumps(fid_pre, indent=2))
+            print("FID (pretrained after):")
+            print(json.dumps(fid_post, indent=2))
+            return
 
         print("Selected classes (fixed order):")
         print(class_names)
         print("FID (pretrained):")
-        print(json.dumps(fid_scores, indent=2))
+        print(json.dumps(fid_pre, indent=2))
         return
 
     # 2) Train CGAN

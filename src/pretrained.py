@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import torch
-from typing import Callable
+from typing import Callable, Dict, List, Tuple
+import torch.nn as nn
+from torchvision import models
+import torch.nn.functional as F
 
 
 def load_pretrained_gan(gan_type: str = "biggan", resolution: int | None = None):
@@ -93,4 +96,118 @@ def make_class_latent_samplers(G, z_dim: int, device: torch.device):
 
     return sample_y, sample_z
 
+
+
+def _build_imagenet_classifier(device: torch.device) -> nn.Module:
+    """Load a pretrained ImageNet classifier for guidance and Grad-CAM.
+
+    Uses torchvision ResNet-50 with pretrained weights.
+    """
+    try:
+        from torchvision.models import ResNet50_Weights  # type: ignore
+        clf = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+    except Exception:
+        clf = models.resnet50(pretrained=True)
+    clf.eval()
+    return clf.to(device)
+
+
+def _imagenet_preprocess(x: torch.Tensor) -> torch.Tensor:
+    """Resize to 224 and normalize to ImageNet stats.
+
+    Expects input in [-1, 1] or [0, 1]; outputs normalized tensor.
+    """
+    # Bring to [0,1]
+    imgs = x
+    if imgs.min() < 0:
+        imgs = (imgs + 1) / 2
+    imgs = imgs.clamp(0, 1)
+    # Resize
+    imgs = torch.nn.functional.interpolate(imgs, size=(224, 224), mode="bilinear", align_corners=False)
+    # Normalize
+    mean = torch.tensor([0.485, 0.456, 0.406], device=imgs.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=imgs.device).view(1, 3, 1, 1)
+    imgs = (imgs - mean) / std
+    return imgs
+
+
+def fisher_prune_generator_with_classifier(
+    G: nn.Module,
+    forgotten_biggan_label: int,
+    retained_biggan_labels: List[int],
+    z_dim: int,
+    device: torch.device,
+    max_batches: int = 100,
+    batch_size: int = 32,
+    threshold: float = 15.0,
+) -> Tuple[int, int]:
+    """Unlearn a BigGAN class by Fisher pruning using a pretrained ImageNet classifier.
+
+    Computes generator Fisher diagonals on two sets: forgotten vs retained labels, using
+    cross-entropy on a fixed pretrained classifier applied to generated images.
+    Prunes parameters where ratio(F_forgotten / F_retained) > threshold.
+
+    Returns: (num_pruned_elements)
+    """
+    clf = _build_imagenet_classifier(device)
+    G = G.to(device)
+    G.train()  # ensure gradients can flow
+
+    def _zeros_like_named_params(module: nn.Module) -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+        for name, p in module.named_parameters():
+            if p.requires_grad:
+                out[name] = torch.zeros_like(p.data, device=p.device)
+        return out
+
+    def _accumulate(module: nn.Module, accum: Dict[str, torch.Tensor]) -> None:
+        for name, p in module.named_parameters():
+            if (not p.requires_grad) or (p.grad is None):
+                continue
+            accum[name] = accum[name] + (p.grad.detach() ** 2)
+
+    def _normalize(accum: Dict[str, torch.Tensor], denom: float) -> Dict[str, torch.Tensor]:
+        eps = 1e-8
+        return {k: v / max(denom, eps) for k, v in accum.items()}
+
+    def _calc_fisher_for_labels(labels: List[int]) -> Dict[str, torch.Tensor]:
+        accum = _zeros_like_named_params(G)
+        batches = 0
+        if len(labels) == 0:
+            return accum
+        while batches < max_batches:
+            bsz = batch_size
+            # Sample uniform classes from the given set
+            y = torch.tensor([labels[i % len(labels)] for i in range(bsz)], device=device, dtype=torch.long)
+            z = torch.randn(bsz, z_dim, device=device)
+            G.zero_grad(set_to_none=True)
+            # forward through G
+            x = G(z=z, y=y)
+            # classifier loss on target labels (ImageNet indices)
+            logits = clf(_imagenet_preprocess(x))
+            loss = F.cross_entropy(logits, y)
+            loss.backward()
+            _accumulate(G, accum)
+            batches += 1
+        return _normalize(accum, float(max(1, batches)))
+
+    fisher_forgot = _calc_fisher_for_labels([forgotten_biggan_label])
+    fisher_retain = _calc_fisher_for_labels(retained_biggan_labels)
+
+    # Prune by ratio
+    eps = 1e-8
+    num_pruned = 0
+    for name, p in G.named_parameters():
+        if not p.requires_grad:
+            continue
+        ff = fisher_forgot[name]
+        fr = fisher_retain[name]
+        ratio = ff / (fr + eps)
+        mask = ratio > threshold
+        if mask.any():
+            with torch.no_grad():
+                num_pruned += int(mask.sum().item())
+                p.data[mask] = 0.0
+
+    return num_pruned, 0
 
