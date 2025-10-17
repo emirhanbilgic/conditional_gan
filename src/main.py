@@ -18,7 +18,7 @@ from .data import (
     load_imagenet_datasets,
 )
 from .trainer import TrainConfig, CGANTrainer
-from .fid import FIDConfig, FIDEvaluator, FIDEvaluatorFromSampler
+from .fid import FIDConfig, FIDEvaluator, FIDEvaluatorFromSampler, InceptionEmbedder
 from .utils import ensure_dir, write_json, GradCAM, overlay_heatmap_on_images
 from .pretrained import (
     load_pretrained_gan,
@@ -61,6 +61,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pretrained_fisher_batches", type=int, default=100, help="Max batches per side for Fisher in pretrained mode")
     p.add_argument("--pretrained_fisher_batch_size", type=int, default=32, help="Batch size for Fisher accumulation in pretrained mode")
     p.add_argument("--pretrained_fisher_threshold", type=float, default=15.0, help="Threshold on Fisher ratio for pruning in pretrained mode")
+    # Analysis: correlation vs FID delta
+    p.add_argument("--analyze_correlation", type=int, default=0, help="1 to compute correlation vs FID delta and save a plot")
+    p.add_argument("--correlation_source", type=str, default="real", choices=["real", "fake_pre", "fake_post"], help="Source features for correlation computation")
     # Dataset switch: CIFAR-10 vs ImageNet-like subset
     p.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "imagenet_subset"], help="Select dataset source")
     p.add_argument("--imagenet_classes", type=str, default="", help="Comma-separated class names to select (ImageFolder subdir names). If empty, auto-select first 10.")
@@ -281,6 +284,109 @@ def main() -> None:
             fid_eval_after = FIDEvaluatorFromSampler(sampler_after, num_classes=num_classes, cfg=fcfg)
             fid_post = fid_eval_after.compute_fid(val_ds, z_dim=args.z_dim)
             write_json(fid_post, os.path.join(args.work_dir, "metrics", "fid_pretrained_after.json"))
+
+            # Optional analysis: correlation vs FID delta
+            if int(args.analyze_correlation) == 1:
+                import numpy as np
+                import matplotlib.pyplot as plt
+                from collections import defaultdict
+
+                # 1) Build Inception features by class for chosen source
+                device_emb = torch.device(args.device if torch.cuda.is_available() else "cpu")
+                embedder = InceptionEmbedder(device_emb)
+                per_class_feats: dict[int, list[np.ndarray]] = {c: [] for c in range(num_classes)}
+
+                def collect_feats_from_sampler(sampler_fn, z_dim: int, per_class: int) -> dict[int, np.ndarray]:
+                    out: dict[int, list[np.ndarray]] = {c: [] for c in range(num_classes)}
+                    for cls in range(num_classes):
+                        remaining = per_class
+                        while remaining > 0:
+                            bsz = min(max(16, args.batch_size // 2), remaining)
+                            z = torch.randn(bsz, z_dim, device=device_emb)
+                            y = torch.full((bsz,), cls, dtype=torch.long, device=device_emb)
+                            x = sampler_fn(z, y)
+                            feats = embedder.get_activations(x).cpu().numpy()
+                            out[cls].append(feats)
+                            remaining -= bsz
+                    return {c: np.concatenate(v, axis=0) for c, v in out.items() if len(v) > 0}
+
+                def collect_feats_from_dataset(dataset) -> dict[int, np.ndarray]:
+                    from torch.utils.data import DataLoader
+                    loader = DataLoader(dataset, batch_size=max(32, args.batch_size // 2), shuffle=False, num_workers=max(1, args.num_workers // 2), pin_memory=(device_emb.type == "cuda"))
+                    out: dict[int, list[np.ndarray]] = {c: [] for c in range(num_classes)}
+                    with torch.no_grad():
+                        for x, y in loader:
+                            x = x.to(device_emb)
+                            y = y.to(device_emb)
+                            feats = embedder.get_activations(x).cpu().numpy()
+                            for i in range(len(y)):
+                                out[int(y[i].item())].append(feats[i:i+1])
+                    return {c: np.concatenate(v, axis=0) for c, v in out.items() if len(v) > 0}
+
+                if args.correlation_source == "real":
+                    feats_by_class = collect_feats_from_dataset(val_ds)
+                elif args.correlation_source == "fake_pre":
+                    feats_by_class = collect_feats_from_sampler(sampler, args.z_dim, per_class=max(50, args.fid_num_samples_per_class // 2))
+                else:
+                    feats_by_class = collect_feats_from_sampler(sampler_after, args.z_dim, per_class=max(50, args.fid_num_samples_per_class // 2))
+
+                # 2) Compute class means and cosine similarity vs forgotten class
+                def _mean(v: np.ndarray) -> np.ndarray:
+                    return v.mean(axis=0)
+                means = {c: _mean(v) for c, v in feats_by_class.items()}
+                forgotten_new = int(args.pretrained_unlearn_label)
+                if forgotten_new not in means:
+                    # If class missing (edge case), skip plotting
+                    pass
+                else:
+                    import numpy as np
+                    def _cos(a, b):
+                        denom = (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+                        return float(np.dot(a, b) / denom)
+                    ref = means[forgotten_new]
+                    corr = {c: _cos(ref, m) for c, m in means.items()}
+
+                    # 3) Build FID delta per class (post - pre)
+                    fid_delta = {}
+                    for c in range(num_classes):
+                        key = f"class_{c}"
+                        if key in fid_pre and key in fid_post:
+                            fid_delta[c] = float(fid_post[key] - fid_pre[key])
+
+                    # 4) Save CSV and plot
+                    import csv, os
+                    metrics_dir = os.path.join(args.work_dir, "metrics")
+                    os.makedirs(metrics_dir, exist_ok=True)
+                    csv_path = os.path.join(metrics_dir, "correlation_vs_fid_delta.csv")
+                    with open(csv_path, "w", newline="") as f:
+                        w = csv.writer(f)
+                        w.writerow(["class_index", "class_name", "correlation_with_forgotten", "fid_delta_after_unlearning"])
+                        for c in range(num_classes):
+                            w.writerow([
+                                c,
+                                class_names[c] if c < len(class_names) else str(c),
+                                corr.get(c, None),
+                                fid_delta.get(c, None),
+                            ])
+
+                    # Line plot with two y-series
+                    xs = list(range(num_classes))
+                    y1 = [corr.get(c, float("nan")) for c in xs]
+                    y2 = [fid_delta.get(c, float("nan")) for c in xs]
+                    plt.figure(figsize=(10, 4))
+                    plt.plot(xs, y1, marker='o', label='cosine correlation vs forgotten')
+                    plt.plot(xs, y2, marker='x', label='FID delta (post - pre)')
+                    plt.axvline(forgotten_new, color='red', linestyle='--', alpha=0.5, label='forgotten class')
+                    plt.xticks(xs, [str(c) for c in xs], rotation=45)
+                    plt.xlabel('class index (remapped order)')
+                    plt.ylabel('value')
+                    plt.title('Correlation to forgotten vs FID change after unlearning')
+                    plt.legend()
+                    plt.tight_layout()
+                    plot_path = os.path.join(metrics_dir, "correlation_vs_fid_delta.png")
+                    plt.savefig(plot_path)
+                    if int(args.show_plots) == 1:
+                        plt.show()
 
             print("Selected classes (fixed order):")
             print(class_names)
