@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--unlearning_type", type=str, default="pure_finetuning", choices=["pure_finetuning", "fisher"], help="Unlearning strategy: pure_finetuning or fisher")
-    p.add_argument("--samples_per_class", type=int, default=2, help="Number of samples to generate per class for before/after snapshots")
+    p.add_argument("--samples_per_class", type=int, default=10, help="Number of samples to generate per class for before/after snapshots")
     # Performance/memory toggles
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--pin_memory", type=int, default=1, help="1 to enable pin_memory when CUDA; 0 to disable")
