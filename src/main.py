@@ -355,7 +355,8 @@ def main() -> None:
 
                     # 4) Save CSV and plot
                     import csv, os
-                    metrics_dir = os.path.join(args.work_dir, "metrics")
+                    # Save analysis under the timestamped trial directory for consistency
+                    metrics_dir = os.path.join(trial_dir, "metrics")
                     os.makedirs(metrics_dir, exist_ok=True)
                     csv_path = os.path.join(metrics_dir, "correlation_vs_fid_delta.csv")
                     with open(csv_path, "w", newline="") as f:
