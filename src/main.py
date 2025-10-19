@@ -354,7 +354,7 @@ def main() -> None:
                             fid_delta[c] = float(fid_post[key] - fid_pre[key])
 
                     # 4) Save CSV and plot
-                    import csv, os
+                    import csv
                     # Save analysis under the timestamped trial directory for consistency
                     metrics_dir = os.path.join(trial_dir, "metrics")
                     os.makedirs(metrics_dir, exist_ok=True)
