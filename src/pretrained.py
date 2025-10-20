@@ -222,3 +222,96 @@ def fisher_prune_generator_with_classifier(
 
     return num_pruned, 0
 
+
+def ssd_dampen_generator_with_classifier(
+    G: nn.Module,
+    forgotten_biggan_label: int,
+    retained_biggan_labels: List[int],
+    z_dim: int,
+    device: torch.device,
+    *,
+    max_batches: int = 100,
+    batch_size: int = 32,
+    lower_bound: float = 1.0,
+    exponent: float = 1.0,
+    dampening_constant: float = 0.5,
+    selection_weighting: float = 1.0,
+) -> int:
+    """Selective Synaptic Dampening (SSD) on a pretrained conditional generator using a fixed classifier.
+
+    Computes squared-gradient importances on forgotten vs retained label sets using an ImageNet classifier
+    applied to generated images. Multiplies parameters by a dampening factor when forget-importance dominates.
+    """
+    clf = _build_imagenet_classifier(device)
+    for p in clf.parameters():
+        p.requires_grad_(False)
+    G = G.to(device)
+    G.train()
+
+    def _zeros_like_named_params(module: nn.Module) -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+        for name, p in module.named_parameters():
+            if p.requires_grad:
+                out[name] = torch.zeros_like(p.data, device=p.device)
+        return out
+
+    def _accumulate(module: nn.Module, accum: Dict[str, torch.Tensor]) -> None:
+        for name, p in module.named_parameters():
+            if (not p.requires_grad) or (p.grad is None):
+                continue
+            accum[name] = accum[name] + (p.grad.detach() ** 2)
+
+    def _normalize(accum: Dict[str, torch.Tensor], denom: float) -> Dict[str, torch.Tensor]:
+        eps = 1e-8
+        return {k: v / max(denom, eps) for k, v in accum.items()}
+
+    def _calc_importance_for_labels(labels: List[int]) -> Dict[str, torch.Tensor]:
+        accum = _zeros_like_named_params(G)
+        batches = 0
+        if len(labels) == 0:
+            return accum
+        while batches < max_batches:
+            bsz = batch_size
+            # micro-batch
+            mbsz = max(1, min(4, bsz))
+            num_micro = (bsz + mbsz - 1) // mbsz
+            for m in range(num_micro):
+                cur = min(mbsz, bsz - m * mbsz)
+                y = torch.tensor([labels[i % len(labels)] for i in range(cur)], device=device, dtype=torch.long)
+                z = torch.randn(cur, z_dim, device=device)
+                G.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                    x = G(z=z, y=y)
+                    logits = clf(_imagenet_preprocess(x))
+                    loss = F.cross_entropy(logits, y)
+                loss.backward()
+                _accumulate(G, accum)
+                del x, logits, loss, z, y
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            batches += 1
+        return _normalize(accum, float(max(1, batches)))
+
+    imp_forget = _calc_importance_for_labels([forgotten_biggan_label])
+    imp_retain = _calc_importance_for_labels(retained_biggan_labels)
+
+    # Apply dampening
+    num_dampened = 0
+    with torch.no_grad():
+        for name, p in G.named_parameters():
+            if not p.requires_grad:
+                continue
+            oimp = imp_retain.get(name)
+            fimp = imp_forget.get(name)
+            if oimp is None or fimp is None:
+                continue
+            mask = fimp > (oimp * selection_weighting)
+            if not mask.any():
+                continue
+            weight = ((oimp * dampening_constant) / (fimp + 1e-9)).pow(exponent)
+            update = weight[mask]
+            update[update > lower_bound] = lower_bound
+            p.data[mask] = p.data[mask] * update
+            num_dampened += int(mask.sum().item())
+
+    return num_dampened

@@ -4,6 +4,8 @@ import os
 import argparse
 import json
 from typing import List
+import copy
+import optuna
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +26,7 @@ from .pretrained import (
     load_pretrained_gan,
     make_conditional_sampler,
     fisher_prune_generator_with_classifier,
+    ssd_dampen_generator_with_classifier,
     _build_imagenet_classifier,
     _imagenet_preprocess,
 )
@@ -41,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fid_num_samples_per_class", type=int, default=200)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--unlearning_type", type=str, default="pure_finetuning", choices=["pure_finetuning", "fisher"], help="Unlearning strategy: pure_finetuning or fisher")
+    p.add_argument("--unlearning_type", type=str, default="pure_finetuning", choices=["pure_finetuning", "fisher", "ssd"], help="Unlearning strategy: pure_finetuning, fisher, or ssd")
     p.add_argument("--samples_per_class", type=int, default=10, help="Number of samples to generate per class for before/after snapshots")
     # Performance/memory toggles
     p.add_argument("--num_workers", type=int, default=2)
@@ -56,11 +59,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use_pretrained", type=int, default=0, help="1 to use a pretrained GAN instead of training")
     p.add_argument("--pretrained_gan_type", type=str, default="self_conditioned", help="GAN type for pytorch-pretrained-gans, e.g., biggan or self_conditioned")
     p.add_argument("--pretrained_resolution", type=int, default=256, help="Resolution for pretrained GAN, if supported")
-    p.add_argument("--pretrained_unlearn", type=int, default=0, help="1 to apply Fisher pruning unlearning on the pretrained GAN itself")
+    p.add_argument("--pretrained_unlearn", type=int, default=0, help="1 to apply unlearning on the pretrained GAN itself")
+    p.add_argument("--pretrained_unlearn_method", type=str, default="fisher", choices=["fisher", "ssd"], help="Unlearning method for pretrained: fisher or ssd")
     p.add_argument("--pretrained_unlearn_label", type=int, default=0, help="Label [0..K-1] to unlearn in pretrained mode (maps via --imagenet_biggan_indices if provided)")
     p.add_argument("--pretrained_fisher_batches", type=int, default=100, help="Max batches per side for Fisher in pretrained mode")
     p.add_argument("--pretrained_fisher_batch_size", type=int, default=32, help="Batch size for Fisher accumulation in pretrained mode")
     p.add_argument("--pretrained_fisher_threshold", type=float, default=15.0, help="Threshold on Fisher ratio for pruning in pretrained mode")
+    # SSD hyperparameters and Optuna
+    p.add_argument("--ssd_trials", type=int, default=20, help="Number of Optuna trials for SSD hyperparameters (both train and pretrained modes)")
+    p.add_argument("--ssd_lower_bound_min", type=float, default=0.5, help="Min lower_bound for SSD")
+    p.add_argument("--ssd_lower_bound_max", type=float, default=1.0, help="Max lower_bound for SSD")
+    p.add_argument("--ssd_exponent_min", type=float, default=0.5, help="Min exponent for SSD")
+    p.add_argument("--ssd_exponent_max", type=float, default=3.0, help="Max exponent for SSD")
+    p.add_argument("--ssd_dampening_min", type=float, default=0.1, help="Min dampening_constant for SSD")
+    p.add_argument("--ssd_dampening_max", type=float, default=1.0, help="Max dampening_constant for SSD")
+    p.add_argument("--ssd_select_weight_min", type=float, default=0.5, help="Min selection_weighting for SSD")
+    p.add_argument("--ssd_select_weight_max", type=float, default=3.0, help="Max selection_weighting for SSD")
     # Analysis: similarity/divergence vs FID delta
     p.add_argument("--analyze_correlation", type=int, default=0, help="1 to compute similarity/divergence vs FID delta and save a plot")
     p.add_argument("--correlation_source", type=str, default="real", choices=["real", "fake_pre", "fake_post"], help="Source features for analysis (before/after unlearning)")
@@ -217,7 +231,7 @@ def main() -> None:
         fid_pre = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)
         write_json(fid_pre, os.path.join(args.work_dir, "metrics", "fid_pretrained_before.json"))
 
-        # Optional: unlearn one label directly on pretrained GAN via Fisher pruning
+        # Optional: unlearn one label directly on pretrained GAN via chosen method
         if int(args.pretrained_unlearn) == 1:
             # Map the selected new label to BigGAN global label if mapping provided
             target_new = int(args.pretrained_unlearn_label)
@@ -231,17 +245,80 @@ def main() -> None:
                     continue
                 retained_biggan.append(int(mapping_new_to_biggan[new_lbl] if mapping_new_to_biggan is not None else new_lbl))
 
-            pruned_g, _ = fisher_prune_generator_with_classifier(
-                G=Gp,
-                forgotten_biggan_label=forgotten_biggan,
-                retained_biggan_labels=retained_biggan,
-                z_dim=args.z_dim,
-                device=device,
-                max_batches=int(args.pretrained_fisher_batches),
-                batch_size=int(args.pretrained_fisher_batch_size),
-                threshold=float(args.pretrained_fisher_threshold),
-            )
-            print(f"Pretrained unlearning: pruned elements in G = {pruned_g}")
+            # Prepare Optuna objective for SSD when selected; fallback to Fisher otherwise
+            if args.pretrained_unlearn_method == "ssd":
+                fid_eval_for_trial = FIDEvaluatorFromSampler(sampler, num_classes=num_classes, cfg=fcfg)
+                fid_pre = fid_pre  # already computed above
+                base_state = copy.deepcopy(Gp.state_dict())
+
+                def objective(trial: optuna.Trial) -> float:
+                    # Restore base
+                    Gp.load_state_dict(base_state)
+                    # Suggest SSD hyperparameters
+                    lower_bound = trial.suggest_float("lower_bound", args.ssd_lower_bound_min, args.ssd_lower_bound_max)
+                    exponent = trial.suggest_float("exponent", args.ssd_exponent_min, args.ssd_exponent_max)
+                    dampening_constant = trial.suggest_float("dampening_constant", args.ssd_dampening_min, args.ssd_dampening_max)
+                    selection_weighting = trial.suggest_float("selection_weighting", args.ssd_select_weight_min, args.ssd_select_weight_max)
+                    # Apply SSD
+                    _ = ssd_dampen_generator_with_classifier(
+                        G=Gp,
+                        forgotten_biggan_label=forgotten_biggan,
+                        retained_biggan_labels=retained_biggan,
+                        z_dim=args.z_dim,
+                        device=device,
+                        max_batches=int(args.pretrained_fisher_batches),
+                        batch_size=int(args.pretrained_fisher_batch_size),
+                        lower_bound=float(lower_bound),
+                        exponent=float(exponent),
+                        dampening_constant=float(dampening_constant),
+                        selection_weighting=float(selection_weighting),
+                    )
+                    # Evaluate FID after SSD for objective
+                    fid_post_trial = fid_eval_for_trial.compute_fid(val_ds, z_dim=args.z_dim)
+                    key_f = f"class_{target_new}"
+                    delta_forget = float(fid_post_trial.get(key_f, 0.0) - fid_pre.get(key_f, 0.0))
+                    deltas_retained = []
+                    for c in range(num_classes):
+                        if c == target_new:
+                            continue
+                        key = f"class_{c}"
+                        if key in fid_post_trial and key in fid_pre:
+                            deltas_retained.append(float(fid_post_trial[key] - fid_pre[key]))
+                    mean_retained = float(sum(deltas_retained) / max(1, len(deltas_retained)))
+                    # Maximize forgotten increase and reward decreases for retained (negative mean)
+                    score = 2.0 * delta_forget - mean_retained
+                    return float(score)
+
+                study = optuna.create_study(direction="maximize")
+                study.optimize(objective, n_trials=int(args.ssd_trials))
+                print(f"Best SSD params (pretrained): {study.best_params}")
+                # Apply best params to final model
+                Gp.load_state_dict(base_state)
+                _ = ssd_dampen_generator_with_classifier(
+                    G=Gp,
+                    forgotten_biggan_label=forgotten_biggan,
+                    retained_biggan_labels=retained_biggan,
+                    z_dim=args.z_dim,
+                    device=device,
+                    max_batches=int(args.pretrained_fisher_batches),
+                    batch_size=int(args.pretrained_fisher_batch_size),
+                    lower_bound=float(study.best_params["lower_bound"]),
+                    exponent=float(study.best_params["exponent"]),
+                    dampening_constant=float(study.best_params["dampening_constant"]),
+                    selection_weighting=float(study.best_params["selection_weighting"]),
+                )
+            else:
+                pruned_g, _ = fisher_prune_generator_with_classifier(
+                    G=Gp,
+                    forgotten_biggan_label=forgotten_biggan,
+                    retained_biggan_labels=retained_biggan,
+                    z_dim=args.z_dim,
+                    device=device,
+                    max_batches=int(args.pretrained_fisher_batches),
+                    batch_size=int(args.pretrained_fisher_batch_size),
+                    threshold=float(args.pretrained_fisher_threshold),
+                )
+                print(f"Pretrained unlearning: pruned elements in G = {pruned_g}")
 
             # Re-wrap sampler to use updated Gp
             base_sampler_after = make_conditional_sampler(Gp, device)
@@ -599,10 +676,64 @@ def main() -> None:
     train_without_c1 = Subset(train_ds, indices)
     if args.unlearning_type == "pure_finetuning":
         trainer.finetune_excluding_class(train_without_c1, epochs=args.unlearn_epochs)
-    else:
+    elif args.unlearning_type == "fisher":
         # fisher-based unlearning: compute FIM ratio and prune if needed
-        # When fisher is selected and Df/Dr < 2, we skip finetuning entirely per requirement
         trainer.unlearn_with_fisher(train_ds=train_ds, excluded_label=c1_new, z_dim=args.z_dim)
+    else:
+        # SSD with Optuna hyperparameter search
+        fid_pre_train = fid_before
+        base_state_g = copy.deepcopy(trainer.G.state_dict())
+        base_state_d = copy.deepcopy(trainer.D.state_dict())
+
+        def objective_train(trial: optuna.Trial) -> float:
+            # Restore base
+            trainer.G.load_state_dict(base_state_g)
+            trainer.D.load_state_dict(base_state_d)
+            # Suggest params
+            lower_bound = trial.suggest_float("lower_bound", args.ssd_lower_bound_min, args.ssd_lower_bound_max)
+            exponent = trial.suggest_float("exponent", args.ssd_exponent_min, args.ssd_exponent_max)
+            dampening_constant = trial.suggest_float("dampening_constant", args.ssd_dampening_min, args.ssd_dampening_max)
+            selection_weighting = trial.suggest_float("selection_weighting", args.ssd_select_weight_min, args.ssd_select_weight_max)
+            # Apply SSD
+            trainer.ssd_unlearn(
+                train_ds=train_ds,
+                excluded_label=c1_new,
+                lower_bound=float(lower_bound),
+                exponent=float(exponent),
+                dampening_constant=float(dampening_constant),
+                selection_weighting=float(selection_weighting),
+                max_batches=int(max(50, args.batch_size // 2)),
+            )
+            # Compute FID after
+            fid_post_train = fid_eval.compute_fid(val_ds, z_dim=args.z_dim)
+            key_f = f"class_{c1_new}"
+            delta_forget = float(fid_post_train.get(key_f, 0.0) - fid_pre_train.get(key_f, 0.0))
+            deltas_retained = []
+            for c in range(num_classes):
+                if c == c1_new:
+                    continue
+                key = f"class_{c}"
+                if key in fid_post_train and key in fid_pre_train:
+                    deltas_retained.append(float(fid_post_train[key] - fid_pre_train[key]))
+            mean_retained = float(sum(deltas_retained) / max(1, len(deltas_retained)))
+            score = 2.0 * delta_forget - mean_retained
+            return float(score)
+
+        study_tr = optuna.create_study(direction="maximize")
+        study_tr.optimize(objective_train, n_trials=int(args.ssd_trials))
+        print(f"Best SSD params (train): {study_tr.best_params}")
+        # Apply best params finally
+        trainer.G.load_state_dict(base_state_g)
+        trainer.D.load_state_dict(base_state_d)
+        trainer.ssd_unlearn(
+            train_ds=train_ds,
+            excluded_label=c1_new,
+            lower_bound=float(study_tr.best_params["lower_bound"]),
+            exponent=float(study_tr.best_params["exponent"]),
+            dampening_constant=float(study_tr.best_params["dampening_constant"]),
+            selection_weighting=float(study_tr.best_params["selection_weighting"]),
+            max_batches=int(max(50, args.batch_size // 2)),
+        )
 
     # Generate samples after unlearning: N samples per class
     trainer.G.eval()

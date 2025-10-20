@@ -9,3 +9,4 @@ scipy>=1.10.0
 pandas>=2.0.0
 
 pytorch-pretrained-gans @ git+https://github.com/lukemelas/pytorch-pretrained-gans
+optuna>=3.0.0

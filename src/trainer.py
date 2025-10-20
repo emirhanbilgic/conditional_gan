@@ -328,3 +328,128 @@ class CGANTrainer:
         # Optional: could log counts
         print(f"Fisher pruning completed: G pruned elements={pruned_g}, D pruned elements={pruned_d}")
 
+
+    def ssd_unlearn(
+        self,
+        train_ds: Dataset,
+        excluded_label: int,
+        *,
+        lower_bound: float = 1.0,
+        exponent: float = 1.0,
+        dampening_constant: float = 0.5,
+        selection_weighting: float = 1.0,
+        max_batches: int = 100,
+    ) -> None:
+        """Apply Selective Synaptic Dampening (SSD) to G and D without further fine-tuning.
+
+        We compute squared-gradient Fisher-style importances on two subsets: forgotten (Df) and retained (Dr).
+        Parameters that are more important for the forget set than the retain/general set are multiplicatively
+        dampened (never increased).
+        """
+        device = self.device
+
+        # Build subsets
+        forgotten_indices = [i for i in range(len(train_ds)) if int(train_ds[i][1]) == int(excluded_label)]
+        retained_indices = [i for i in range(len(train_ds)) if int(train_ds[i][1]) != int(excluded_label)]
+
+        if len(forgotten_indices) == 0 or len(retained_indices) == 0:
+            return
+
+        forgotten_loader = DataLoader(Subset(train_ds, forgotten_indices), batch_size=self.cfg.batch_size, shuffle=True, num_workers=self.cfg.num_workers, pin_memory=True, drop_last=True)
+        retained_loader = DataLoader(Subset(train_ds, retained_indices), batch_size=self.cfg.batch_size, shuffle=True, num_workers=self.cfg.num_workers, pin_memory=True, drop_last=True)
+
+        def _zeros_like_named_params(module: nn.Module) -> Dict[str, torch.Tensor]:
+            out: Dict[str, torch.Tensor] = {}
+            for name, param in module.named_parameters():
+                if param.requires_grad:
+                    out[name] = torch.zeros_like(param.data, device=param.device)
+            return out
+
+        def _accumulate(module: nn.Module, accum: Dict[str, torch.Tensor]) -> None:
+            for name, param in module.named_parameters():
+                if (not param.requires_grad) or (param.grad is None):
+                    continue
+                accum[name] = accum[name] + (param.grad.detach() ** 2)
+
+        def _normalize(accum: Dict[str, torch.Tensor], denom: float) -> Dict[str, torch.Tensor]:
+            eps = 1e-8
+            return {k: v / max(denom, eps) for k, v in accum.items()}
+
+        def _calculate_importance(module: nn.Module, loader: DataLoader, compute_loss_fn) -> Dict[str, torch.Tensor]:
+            model_was_training = module.training
+            module.eval()
+            importance = _zeros_like_named_params(module)
+            batches_processed = 0
+
+            if len(loader.dataset) == 0:
+                return importance
+
+            for real, y in loader:
+                if batches_processed >= max_batches:
+                    break
+                real = real.to(device)
+                y = y.to(device)
+
+                self.G.zero_grad(set_to_none=True)
+                self.D.zero_grad(set_to_none=True)
+                module.zero_grad(set_to_none=True)
+
+                loss = compute_loss_fn(real, y)
+                loss.backward()
+
+                _accumulate(module, importance)
+                batches_processed += 1
+
+            denom = float(max(1, batches_processed))
+            importance = _normalize(importance, denom)
+
+            if model_was_training:
+                module.train()
+            return importance
+
+        def _compute_importances(loader: DataLoader) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+            # Discriminator importance: standard GAN BCE on real/fake
+            def d_loss(real: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                bsz = real.size(0)
+                with torch.no_grad():
+                    z = sample_noise(bsz, self.cfg.z_dim, device)
+                    fake = self.G(z, y)
+                pred_real = self.D(real, y)
+                pred_fake = self.D(fake, y)
+                return self.criterion(pred_real, torch.ones_like(pred_real)) + \
+                       self.criterion(pred_fake, torch.zeros_like(pred_fake))
+
+            # Generator importance: BCE on D(G(z,y)) vs ones
+            def g_loss(_: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                bsz = y.size(0)
+                z = sample_noise(bsz, self.cfg.z_dim, device)
+                fake = self.G(z, y)
+                pred_fake = self.D(fake, y)
+                return self.criterion(pred_fake, torch.ones_like(pred_fake))
+
+            imp_d = _calculate_importance(self.D, loader, d_loss)
+            imp_g = _calculate_importance(self.G, loader, g_loss)
+            return imp_g, imp_d
+
+        imp_g_forget, imp_d_forget = _compute_importances(forgotten_loader)
+        imp_g_retain, imp_d_retain = _compute_importances(retained_loader)
+
+        def _apply_dampening(module: nn.Module, imp_retain: Dict[str, torch.Tensor], imp_forget: Dict[str, torch.Tensor]) -> None:
+            with torch.no_grad():
+                for name, param in module.named_parameters():
+                    if not param.requires_grad:
+                        continue
+                    oimp = imp_retain.get(name)
+                    fimp = imp_forget.get(name)
+                    if oimp is None or fimp is None:
+                        continue
+                    mask = fimp > (oimp * selection_weighting)
+                    if not mask.any():
+                        continue
+                    weight = ((oimp * dampening_constant) / (fimp + 1e-9)).pow(exponent)
+                    update = weight[mask]
+                    update[update > lower_bound] = lower_bound
+                    param.data[mask] = param.data[mask] * update
+
+        _apply_dampening(self.G, imp_g_retain, imp_g_forget)
+        _apply_dampening(self.D, imp_d_retain, imp_d_forget)
