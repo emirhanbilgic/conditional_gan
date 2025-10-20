@@ -81,9 +81,9 @@ def main() -> None:
     # 1) Load dataset (CIFAR-10 or ImageNet-like subset)
     os.makedirs(args.data_dir, exist_ok=True)
     if args.dataset == "cifar10":
-        c_cfg = CIFAR10Config(data_dir=args.data_dir, img_size=args.img_size, train_download=True, test_download=True, seed=args.seed)
-        train_ds, val_ds, _, class_names = load_cifar10_datasets(c_cfg)
-        num_classes = 10
+    c_cfg = CIFAR10Config(data_dir=args.data_dir, img_size=args.img_size, train_download=True, test_download=True, seed=args.seed)
+    train_ds, val_ds, _, class_names = load_cifar10_datasets(c_cfg)
+    num_classes = 10
     else:
         selected = [s.strip() for s in args.imagenet_classes.split(",") if len(s.strip()) > 0]
         i_cfg = ImageNetSubsetConfig(
@@ -390,14 +390,19 @@ def main() -> None:
                         return 0.5 * (term_trace + term_quad - k + term_logdet)
 
                     mu_f, S_f = stats[forgotten_new]
+                    # Compute both metrics for completeness
+                    cosine_vals = {c: _cos(mu_f, stats[c][0]) for c in stats.keys()}
+                    kl_vals = {c: _kl_gauss(mu_f, S_f, stats[c][0], stats[c][1]) for c in stats.keys()}
                     if args.divergence_metric == "cosine":
-                        # Similarity: cosine between means
-                        metric_vals = {c: _cos(mu_f, stats[c][0]) for c in stats.keys()}
+                        metric_vals = cosine_vals
                         metric_name = "cosine_similarity"
+                        secondary_vals = kl_vals
+                        secondary_name = "kl_divergence_forgotten_to_class"
                     else:
-                        # Divergence: KL(N_forgotten || N_c)
-                        metric_vals = {c: _kl_gauss(mu_f, S_f, stats[c][0], stats[c][1]) for c in stats.keys()}
+                        metric_vals = kl_vals
                         metric_name = "kl_divergence_forgotten_to_class"
+                        secondary_vals = cosine_vals
+                        secondary_name = "cosine_similarity"
 
                     # 3) Build FID delta per class (post - pre)
                     fid_delta = {}
@@ -414,12 +419,13 @@ def main() -> None:
                     csv_path = os.path.join(metrics_dir, "divergence_vs_fid_delta.csv")
                     with open(csv_path, "w", newline="") as f:
                         w = csv.writer(f)
-                        w.writerow(["class_index", "class_name", metric_name, "fid_delta_after_unlearning"])
+                        w.writerow(["class_index", "class_name", metric_name, secondary_name, "fid_delta_after_unlearning"])
                         for c in range(num_classes):
                             w.writerow([
                                 c,
                                 class_names[c] if c < len(class_names) else str(c),
                                 metric_vals.get(c, None),
+                                secondary_vals.get(c, None),
                                 fid_delta.get(c, None),
                             ])
 
@@ -430,6 +436,7 @@ def main() -> None:
                     fig, ax1 = plt.subplots(figsize=(10, 4))
                     color1 = 'tab:blue'
                     color2 = 'tab:orange'
+                    color3 = 'tab:green'
                     l1, = ax1.plot(xs, y1, marker='o', color=color1, label=metric_name.replace('_', ' '))
                     ax1.set_xlabel('class index (remapped order)')
                     ax1.set_ylabel(metric_name.replace('_', ' '), color=color1)
@@ -443,7 +450,17 @@ def main() -> None:
                     ax2.set_ylabel('FID delta (post - pre)', color=color2)
                     ax2.tick_params(axis='y', labelcolor=color2)
 
-                    lines = [l1, l2]
+                    # Third axis for the secondary metric (e.g., cosine if KL is primary)
+                    ax3 = ax1.twinx()
+                    ax3.spines['right'].set_position(('axes', 1.12))
+                    # Make the spine visible
+                    ax3.spines['right'].set_visible(True)
+                    y3 = [secondary_vals.get(c, float('nan')) for c in xs]
+                    l3, = ax3.plot(xs, y3, marker='^', color=color3, label=secondary_name.replace('_', ' '))
+                    ax3.set_ylabel(secondary_name.replace('_', ' '), color=color3)
+                    ax3.tick_params(axis='y', labelcolor=color3)
+
+                    lines = [l1, l2, l3]
                     labels = [l.get_label() for l in lines]
                     fig.legend(lines, labels, loc='upper right')
                     fig.suptitle('Divergence/similarity to forgotten vs FID change after unlearning')
