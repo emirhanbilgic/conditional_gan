@@ -285,9 +285,13 @@ def main() -> None:
                         key = f"class_{c}"
                         if key in fid_post_trial and key in fid_pre:
                             deltas_retained.append(float(fid_post_trial[key] - fid_pre[key]))
-                    mean_retained = float(sum(deltas_retained) / max(1, len(deltas_retained)))
-                    # Maximize forgotten increase and reward decreases for retained (negative mean)
-                    score = 2.0 * delta_forget - mean_retained
+                    # Penalize retained increases; reward a bit the forgotten increase
+                    pos_increases = [d for d in deltas_retained if d > 0.0]
+                    mean_pos = float(sum(pos_increases) / max(1, len(deltas_retained))) if len(deltas_retained) > 0 else 0.0
+                    max_pos = float(max(pos_increases)) if len(pos_increases) > 0 else 0.0
+                    delta_f_pos = max(0.0, delta_forget)
+                    # Emphasize retained penalty, add small reward for forgotten increase
+                    score = 0.5 * delta_f_pos - (mean_pos + max_pos)
                     return float(score)
 
                 study = optuna.create_study(direction="maximize")
@@ -728,8 +732,12 @@ def main() -> None:
                 key = f"class_{c}"
                 if key in fid_post_train and key in fid_pre_train:
                     deltas_retained.append(float(fid_post_train[key] - fid_pre_train[key]))
-            mean_retained = float(sum(deltas_retained) / max(1, len(deltas_retained)))
-            score = 2.0 * delta_forget - mean_retained
+            # Penalize retained increases; reward a bit the forgotten increase
+            pos_increases = [d for d in deltas_retained if d > 0.0]
+            mean_pos = float(sum(pos_increases) / max(1, len(deltas_retained))) if len(deltas_retained) > 0 else 0.0
+            max_pos = float(max(pos_increases)) if len(pos_increases) > 0 else 0.0
+            delta_f_pos = max(0.0, delta_forget)
+            score = 0.5 * delta_f_pos - (mean_pos + max_pos)
             return float(score)
 
         study_tr = optuna.create_study(direction="maximize")
