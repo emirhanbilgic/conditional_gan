@@ -61,9 +61,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pretrained_fisher_batches", type=int, default=100, help="Max batches per side for Fisher in pretrained mode")
     p.add_argument("--pretrained_fisher_batch_size", type=int, default=32, help="Batch size for Fisher accumulation in pretrained mode")
     p.add_argument("--pretrained_fisher_threshold", type=float, default=15.0, help="Threshold on Fisher ratio for pruning in pretrained mode")
-    # Analysis: correlation vs FID delta
-    p.add_argument("--analyze_correlation", type=int, default=0, help="1 to compute correlation vs FID delta and save a plot")
-    p.add_argument("--correlation_source", type=str, default="real", choices=["real", "fake_pre", "fake_post"], help="Source features for correlation computation")
+    # Analysis: similarity/divergence vs FID delta
+    p.add_argument("--analyze_correlation", type=int, default=0, help="1 to compute similarity/divergence vs FID delta and save a plot")
+    p.add_argument("--correlation_source", type=str, default="real", choices=["real", "fake_pre", "fake_post"], help="Source features for analysis (before/after unlearning)")
+    p.add_argument("--divergence_metric", type=str, default="kl", choices=["cosine", "kl"], help="Use cosine similarity or KL divergence between classes")
     # Dataset switch: CIFAR-10 vs ImageNet-like subset
     p.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "imagenet_subset"], help="Select dataset source")
     p.add_argument("--imagenet_classes", type=str, default="", help="Comma-separated class names to select (ImageFolder subdir names). If empty, auto-select first 10.")
@@ -352,21 +353,51 @@ def main() -> None:
                 else:
                     feats_by_class = collect_feats_from_sampler(sampler_after, args.z_dim, per_class=max(50, args.fid_num_samples_per_class // 2))
 
-                # 2) Compute class means and cosine similarity vs forgotten class
-                def _mean(v: np.ndarray) -> np.ndarray:
-                    return v.mean(axis=0)
-                means = {c: _mean(v) for c, v in feats_by_class.items()}
+                # 2) Fit per-class Gaussian stats
+                def _mean_cov(v: np.ndarray):
+                    mu = v.mean(axis=0)
+                    # rowvar=False for features
+                    sig = np.cov(v, rowvar=False)
+                    return mu, sig
+                stats = {c: _mean_cov(v) for c, v in feats_by_class.items()}
                 forgotten_new = int(args.pretrained_unlearn_label)
-                if forgotten_new not in means:
+                if forgotten_new not in stats:
                     # If class missing (edge case), skip plotting
                     pass
                 else:
                     import numpy as np
+                    # Cosine similarity based on means
                     def _cos(a, b):
                         denom = (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
                         return float(np.dot(a, b) / denom)
-                    ref = means[forgotten_new]
-                    corr = {c: _cos(ref, m) for c, m in means.items()}
+                    # KL divergence between Gaussians N0(mu0,S0) || N1(mu1,S1)
+                    # KL = 0.5*( tr(S1^{-1} S0) + (mu1-mu0)^T S1^{-1} (mu1-mu0) - k + ln(|S1|/|S0|) )
+                    def _kl_gauss(mu0, S0, mu1, S1, eps=1e-6):
+                        k = mu0.shape[0]
+                        # Stabilize covariances
+                        S0s = S0 + np.eye(k) * eps
+                        S1s = S1 + np.eye(k) * eps
+                        invS1 = np.linalg.inv(S1s)
+                        diff = (mu1 - mu0).reshape(-1, 1)
+                        term_trace = np.trace(invS1 @ S0s)
+                        term_quad = float(diff.T @ invS1 @ diff)
+                        sign0, logdet0 = np.linalg.slogdet(S0s)
+                        sign1, logdet1 = np.linalg.slogdet(S1s)
+                        if sign0 <= 0 or sign1 <= 0:
+                            # Fallback if not SPD numerically
+                            return float('nan')
+                        term_logdet = logdet1 - logdet0
+                        return 0.5 * (term_trace + term_quad - k + term_logdet)
+
+                    mu_f, S_f = stats[forgotten_new]
+                    if args.divergence_metric == "cosine":
+                        # Similarity: cosine between means
+                        metric_vals = {c: _cos(mu_f, stats[c][0]) for c in stats.keys()}
+                        metric_name = "cosine_similarity"
+                    else:
+                        # Divergence: KL(N_forgotten || N_c)
+                        metric_vals = {c: _kl_gauss(mu_f, S_f, stats[c][0], stats[c][1]) for c in stats.keys()}
+                        metric_name = "kl_divergence_forgotten_to_class"
 
                     # 3) Build FID delta per class (post - pre)
                     fid_delta = {}
@@ -380,33 +411,33 @@ def main() -> None:
                     # Save analysis under the timestamped trial directory for consistency
                     metrics_dir = os.path.join(trial_dir, "metrics")
                     os.makedirs(metrics_dir, exist_ok=True)
-                    csv_path = os.path.join(metrics_dir, "correlation_vs_fid_delta.csv")
+                    csv_path = os.path.join(metrics_dir, "divergence_vs_fid_delta.csv")
                     with open(csv_path, "w", newline="") as f:
                         w = csv.writer(f)
-                        w.writerow(["class_index", "class_name", "correlation_with_forgotten", "fid_delta_after_unlearning"])
+                        w.writerow(["class_index", "class_name", metric_name, "fid_delta_after_unlearning"])
                         for c in range(num_classes):
                             w.writerow([
                                 c,
                                 class_names[c] if c < len(class_names) else str(c),
-                                corr.get(c, None),
+                                metric_vals.get(c, None),
                                 fid_delta.get(c, None),
                             ])
 
                     # Line plot with two y-series
                     xs = list(range(num_classes))
-                    y1 = [corr.get(c, float("nan")) for c in xs]
+                    y1 = [metric_vals.get(c, float("nan")) for c in xs]
                     y2 = [fid_delta.get(c, float("nan")) for c in xs]
                     plt.figure(figsize=(10, 4))
-                    plt.plot(xs, y1, marker='o', label='cosine correlation vs forgotten')
+                    plt.plot(xs, y1, marker='o', label=metric_name.replace('_', ' '))
                     plt.plot(xs, y2, marker='x', label='FID delta (post - pre)')
                     plt.axvline(forgotten_new, color='red', linestyle='--', alpha=0.5, label='forgotten class')
                     plt.xticks(xs, [str(c) for c in xs], rotation=45)
                     plt.xlabel('class index (remapped order)')
                     plt.ylabel('value')
-                    plt.title('Correlation to forgotten vs FID change after unlearning')
+                    plt.title('Divergence/similarity to forgotten vs FID change after unlearning')
                     plt.legend()
                     plt.tight_layout()
-                    plot_path = os.path.join(metrics_dir, "correlation_vs_fid_delta.png")
+                    plot_path = os.path.join(metrics_dir, "divergence_vs_fid_delta.png")
                     plt.savefig(plot_path)
                     if int(args.show_plots) == 1:
                         plt.show()
