@@ -169,24 +169,34 @@ def main() -> None:
             grid = make_grid(imgs_all, nrow=per_class, normalize=True, value_range=(-1, 1))
             save_image(grid, os.path.join(before_dir, "grid_all_classes.png"))
 
-        # Grad-CAM overlays (before unlearning) using pretrained ImageNet classifier
+        # Grad-CAM overlays (before unlearning) using pretrained ImageNet classifier (micro-batched)
         if clf_for_cam is not None and target_layer_for_cam is not None:
             try:
                 gradcam = GradCAM(clf_for_cam, target_layer_for_cam, device=device)
-                imgs_b = imgs_all.to(device)
-                # Build target ImageNet label vector per image
+                imgs_b_full = imgs_all.to(device)
                 labels_list = []
                 for new_lbl in range(num_classes):
                     mapped = int(mapping_new_to_biggan[new_lbl]) if mapping_new_to_biggan is not None else int(new_lbl)
                     labels_list.extend([mapped] * per_class)
-                labels_b = torch.tensor(labels_list, device=device, dtype=torch.long)
-                imgs_b.requires_grad_(True)
-                logits_b = clf_for_cam(_imagenet_preprocess(imgs_b))
-                score_b = logits_b.gather(1, labels_b.view(-1, 1)).sum()
-                cam_b = gradcam.compute_heatmap(score_b)
-                cam_b_up = torch.nn.functional.interpolate(cam_b, size=imgs_b.shape[-2:], mode="bilinear", align_corners=False)
-                overlays_b = overlay_heatmap_on_images(imgs_b.detach(), cam_b_up.detach(), alpha=0.5).cpu()
-                grid_cam_b = make_grid(overlays_b, nrow=per_class, normalize=True)
+                labels_b_full = torch.tensor(labels_list, device=device, dtype=torch.long)
+
+                overlays_parts = []
+                cam_bsz = min(16, max(4, args.batch_size // 4))
+                for start in range(0, imgs_b_full.size(0), cam_bsz):
+                    end = min(imgs_b_full.size(0), start + cam_bsz)
+                    imgs_b = imgs_b_full[start:end].clone().requires_grad_(True)
+                    labels_b = labels_b_full[start:end]
+                    logits_b = clf_for_cam(_imagenet_preprocess(imgs_b))
+                    score_b = logits_b.gather(1, labels_b.view(-1, 1)).sum()
+                    cam_b = gradcam.compute_heatmap(score_b)
+                    cam_b_up = torch.nn.functional.interpolate(cam_b, size=imgs_b.shape[-2:], mode="bilinear", align_corners=False)
+                    overlays_b = overlay_heatmap_on_images(imgs_b.detach(), cam_b_up.detach(), alpha=0.5).cpu()
+                    overlays_parts.append(overlays_b)
+                    del imgs_b, labels_b, logits_b, score_b, cam_b, cam_b_up
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                overlays_all = torch.cat(overlays_parts, dim=0)
+                grid_cam_b = make_grid(overlays_all, nrow=per_class, normalize=True)
                 save_image(grid_cam_b, os.path.join(before_dir, "gradcam_overlay_grid.png"))
                 gradcam.remove_hooks()
             except Exception:
@@ -259,22 +269,34 @@ def main() -> None:
                 grid_after = make_grid(imgs_after, nrow=per_class, normalize=True, value_range=(-1, 1))
                 save_image(grid_after, os.path.join(after_dir, "grid_all_classes.png"))
 
+            # Grad-CAM overlays AFTER unlearning (micro-batched)
             if clf_for_cam is not None and target_layer_for_cam is not None:
                 try:
                     gradcam = GradCAM(clf_for_cam, target_layer_for_cam, device=device)
-                    imgs_a = imgs_after.to(device)
+                    imgs_a_full = imgs_after.to(device)
                     labels_list_a = []
                     for new_lbl in range(num_classes):
                         mapped = int(mapping_new_to_biggan[new_lbl]) if mapping_new_to_biggan is not None else int(new_lbl)
                         labels_list_a.extend([mapped] * per_class)
-                    labels_a = torch.tensor(labels_list_a, device=device, dtype=torch.long)
-                    imgs_a.requires_grad_(True)
-                    logits_a = clf_for_cam(_imagenet_preprocess(imgs_a))
-                    score_a = logits_a.gather(1, labels_a.view(-1, 1)).sum()
-                    cam_a = gradcam.compute_heatmap(score_a)
-                    cam_a_up = torch.nn.functional.interpolate(cam_a, size=imgs_a.shape[-2:], mode="bilinear", align_corners=False)
-                    overlays_a = overlay_heatmap_on_images(imgs_a.detach(), cam_a_up.detach(), alpha=0.5).cpu()
-                    grid_cam_a = make_grid(overlays_a, nrow=per_class, normalize=True)
+                    labels_a_full = torch.tensor(labels_list_a, device=device, dtype=torch.long)
+
+                    overlays_parts_a = []
+                    cam_bsz = min(16, max(4, args.batch_size // 4))
+                    for start in range(0, imgs_a_full.size(0), cam_bsz):
+                        end = min(imgs_a_full.size(0), start + cam_bsz)
+                        imgs_a = imgs_a_full[start:end].clone().requires_grad_(True)
+                        labels_a = labels_a_full[start:end]
+                        logits_a = clf_for_cam(_imagenet_preprocess(imgs_a))
+                        score_a = logits_a.gather(1, labels_a.view(-1, 1)).sum()
+                        cam_a = gradcam.compute_heatmap(score_a)
+                        cam_a_up = torch.nn.functional.interpolate(cam_a, size=imgs_a.shape[-2:], mode="bilinear", align_corners=False)
+                        overlays_a = overlay_heatmap_on_images(imgs_a.detach(), cam_a_up.detach(), alpha=0.5).cpu()
+                        overlays_parts_a.append(overlays_a)
+                        del imgs_a, labels_a, logits_a, score_a, cam_a, cam_a_up
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    overlays_all_a = torch.cat(overlays_parts_a, dim=0)
+                    grid_cam_a = make_grid(overlays_all_a, nrow=per_class, normalize=True)
                     save_image(grid_cam_a, os.path.join(after_dir, "gradcam_overlay_grid.png"))
                     gradcam.remove_hooks()
                 except Exception:
