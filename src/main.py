@@ -81,10 +81,12 @@ def main() -> None:
     # 1) Load dataset (CIFAR-10 or ImageNet-like subset)
     os.makedirs(args.data_dir, exist_ok=True)
     if args.dataset == "cifar10":
-    c_cfg = CIFAR10Config(data_dir=args.data_dir, img_size=args.img_size, train_download=True, test_download=True, seed=args.seed)
-    train_ds, val_ds, _, class_names = load_cifar10_datasets(c_cfg)
-    num_classes = 10
+        # dataset: CIFAR-10
+        c_cfg = CIFAR10Config(data_dir=args.data_dir, img_size=args.img_size, train_download=True, test_download=True, seed=args.seed)
+        train_ds, val_ds, _, class_names = load_cifar10_datasets(c_cfg)
+        num_classes = 10
     else:
+        # dataset: ImageNet-like subset
         selected = [s.strip() for s in args.imagenet_classes.split(",") if len(s.strip()) > 0]
         i_cfg = ImageNetSubsetConfig(
             data_dir=args.data_dir,
