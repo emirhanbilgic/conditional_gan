@@ -423,22 +423,33 @@ def main() -> None:
                                 fid_delta.get(c, None),
                             ])
 
-                    # Line plot with two y-series
+                    # Line plot with dual y-axes (left: divergence/similarity, right: FID delta)
                     xs = list(range(num_classes))
                     y1 = [metric_vals.get(c, float("nan")) for c in xs]
                     y2 = [fid_delta.get(c, float("nan")) for c in xs]
-                    plt.figure(figsize=(10, 4))
-                    plt.plot(xs, y1, marker='o', label=metric_name.replace('_', ' '))
-                    plt.plot(xs, y2, marker='x', label='FID delta (post - pre)')
-                    plt.axvline(forgotten_new, color='red', linestyle='--', alpha=0.5, label='forgotten class')
-                    plt.xticks(xs, [str(c) for c in xs], rotation=45)
-                    plt.xlabel('class index (remapped order)')
-                    plt.ylabel('value')
-                    plt.title('Divergence/similarity to forgotten vs FID change after unlearning')
-                    plt.legend()
-                    plt.tight_layout()
+                    fig, ax1 = plt.subplots(figsize=(10, 4))
+                    color1 = 'tab:blue'
+                    color2 = 'tab:orange'
+                    l1, = ax1.plot(xs, y1, marker='o', color=color1, label=metric_name.replace('_', ' '))
+                    ax1.set_xlabel('class index (remapped order)')
+                    ax1.set_ylabel(metric_name.replace('_', ' '), color=color1)
+                    ax1.tick_params(axis='y', labelcolor=color1)
+                    ax1.set_xticks(xs)
+                    ax1.set_xticklabels([str(c) for c in xs], rotation=45)
+                    ax1.axvline(forgotten_new, color='red', linestyle='--', alpha=0.5)
+
+                    ax2 = ax1.twinx()
+                    l2, = ax2.plot(xs, y2, marker='x', color=color2, label='FID delta (post - pre)')
+                    ax2.set_ylabel('FID delta (post - pre)', color=color2)
+                    ax2.tick_params(axis='y', labelcolor=color2)
+
+                    lines = [l1, l2]
+                    labels = [l.get_label() for l in lines]
+                    fig.legend(lines, labels, loc='upper right')
+                    fig.suptitle('Divergence/similarity to forgotten vs FID change after unlearning')
+                    fig.tight_layout(rect=[0, 0.02, 1, 0.95])
                     plot_path = os.path.join(metrics_dir, "divergence_vs_fid_delta.png")
-                    plt.savefig(plot_path)
+                    fig.savefig(plot_path)
                     if int(args.show_plots) == 1:
                         plt.show()
 
