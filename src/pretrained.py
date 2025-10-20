@@ -235,7 +235,7 @@ def ssd_dampen_generator_with_classifier(
     lower_bound: float = 1.0,
     exponent: float = 1.0,
     dampening_constant: float = 0.5,
-    selection_weighting: float = 1.0,
+    selection_weighting: float = 10.0,
 ) -> int:
     """Selective Synaptic Dampening (SSD) on a pretrained conditional generator using a fixed classifier.
 

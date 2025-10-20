@@ -65,16 +65,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pretrained_fisher_batches", type=int, default=100, help="Max batches per side for Fisher in pretrained mode")
     p.add_argument("--pretrained_fisher_batch_size", type=int, default=32, help="Batch size for Fisher accumulation in pretrained mode")
     p.add_argument("--pretrained_fisher_threshold", type=float, default=15.0, help="Threshold on Fisher ratio for pruning in pretrained mode")
-    # SSD hyperparameters and Optuna
-    p.add_argument("--ssd_trials", type=int, default=20, help="Number of Optuna trials for SSD hyperparameters (both train and pretrained modes)")
+    # SSD hyperparameters and Optuna (match paper's ranges)
+    # Map: alpha -> selection_weighting; lambda -> exponent
+    p.add_argument("--ssd_trials", type=int, default=50, help="Number of Optuna trials for SSD hyperparameters (both train and pretrained modes)")
     p.add_argument("--ssd_lower_bound_min", type=float, default=0.5, help="Min lower_bound for SSD")
     p.add_argument("--ssd_lower_bound_max", type=float, default=1.0, help="Max lower_bound for SSD")
-    p.add_argument("--ssd_exponent_min", type=float, default=0.5, help="Min exponent for SSD")
-    p.add_argument("--ssd_exponent_max", type=float, default=3.0, help="Max exponent for SSD")
+    p.add_argument("--ssd_exponent_min", type=float, default=0.1, help="Min exponent (lambda) for SSD") # lambda is ssd
+    p.add_argument("--ssd_exponent_max", type=float, default=5.0, help="Max exponent (lambda) for SSD")
     p.add_argument("--ssd_dampening_min", type=float, default=0.1, help="Min dampening_constant for SSD")
     p.add_argument("--ssd_dampening_max", type=float, default=1.0, help="Max dampening_constant for SSD")
-    p.add_argument("--ssd_select_weight_min", type=float, default=0.5, help="Min selection_weighting for SSD")
-    p.add_argument("--ssd_select_weight_max", type=float, default=3.0, help="Max selection_weighting for SSD")
+    p.add_argument("--ssd_select_weight_min", type=float, default=5.0, help="Min selection_weighting (alpha) for SSD") # alpha in ssd
+    p.add_argument("--ssd_select_weight_max", type=float, default=50.0, help="Max selection_weighting (alpha) for SSD")
     # Analysis: similarity/divergence vs FID delta
     p.add_argument("--analyze_correlation", type=int, default=0, help="1 to compute similarity/divergence vs FID delta and save a plot")
     p.add_argument("--correlation_source", type=str, default="real", choices=["real", "fake_pre", "fake_post"], help="Source features for analysis (before/after unlearning)")
@@ -290,8 +291,20 @@ def main() -> None:
                     return float(score)
 
                 study = optuna.create_study(direction="maximize")
-                study.optimize(objective, n_trials=int(args.ssd_trials))
+                def _callback(study_, trial_):
+                    print(f"[Optuna][pretrained][trial {trial_.number}] score={trial_.value:.5f} params={trial_.params}")
+                study.optimize(objective, n_trials=int(args.ssd_trials), callbacks=[_callback])
                 print(f"Best SSD params (pretrained): {study.best_params}")
+                # Save top-k trials
+                try:
+                    trials_sorted = sorted([t for t in study.trials if t.value is not None], key=lambda t: t.value, reverse=True)
+                    topk = trials_sorted[:min(10, len(trials_sorted))]
+                    top_summary = [{"rank": i+1, "value": float(t.value), **t.params} for i, t in enumerate(topk)]
+                    metrics_dir = os.path.join(trial_dir, "metrics")
+                    os.makedirs(metrics_dir, exist_ok=True)
+                    write_json({"top_trials": top_summary}, os.path.join(metrics_dir, "pretrained_ssd_top_trials.json"))
+                except Exception:
+                    pass
                 # Apply best params to final model
                 Gp.load_state_dict(base_state)
                 _ = ssd_dampen_generator_with_classifier(
@@ -720,8 +733,19 @@ def main() -> None:
             return float(score)
 
         study_tr = optuna.create_study(direction="maximize")
-        study_tr.optimize(objective_train, n_trials=int(args.ssd_trials))
+        def _callback_train(study_, trial_):
+            print(f"[Optuna][train][trial {trial_.number}] score={trial_.value:.5f} params={trial_.params}")
+        study_tr.optimize(objective_train, n_trials=int(args.ssd_trials), callbacks=[_callback_train])
         print(f"Best SSD params (train): {study_tr.best_params}")
+        try:
+            trials_sorted = sorted([t for t in study_tr.trials if t.value is not None], key=lambda t: t.value, reverse=True)
+            topk = trials_sorted[:min(10, len(trials_sorted))]
+            top_summary = [{"rank": i+1, "value": float(t.value), **t.params} for i, t in enumerate(topk)]
+            metrics_dir = os.path.join(trial_dir, "metrics")
+            os.makedirs(metrics_dir, exist_ok=True)
+            write_json({"top_trials": top_summary}, os.path.join(metrics_dir, "train_ssd_top_trials.json"))
+        except Exception:
+            pass
         # Apply best params finally
         trainer.G.load_state_dict(base_state_g)
         trainer.D.load_state_dict(base_state_d)

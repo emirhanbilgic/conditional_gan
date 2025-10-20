@@ -337,7 +337,7 @@ class CGANTrainer:
         lower_bound: float = 1.0,
         exponent: float = 1.0,
         dampening_constant: float = 0.5,
-        selection_weighting: float = 1.0,
+        selection_weighting: float = 10.0,
         max_batches: int = 100,
     ) -> None:
         """Apply Selective Synaptic Dampening (SSD) to G and D without further fine-tuning.
